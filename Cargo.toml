@@ -1,0 +1,23 @@
+[package]
+name = "sherion"
+version = "0.1.0"
+edition = "2021"
+description = "A high-performance Rust terminal emulator"
+license = "MIT"
+rust-version = "1.88"
+
+[dependencies]
+alacritty_terminal = "0.26"
+arboard = "3"
+anyhow = "1"
+parking_lot = "0.12"
+parley = "0.10"
+pollster = "0.4"
+serde = { version = "1", features = ["derive"] }
+thiserror = "1"
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+vello = "0.9"
+wgpu = "29"
+winit = "0.30"

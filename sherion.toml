@@ -1,0 +1,32 @@
+[window]
+title = "Sherion"
+
+[font]
+family = "DejaVu Sans Mono"
+size = 14.0
+# Birincil fontta glyph bulunamazsa (ör. ls/exa Nerd Font ikonları) sırayla denenir.
+# Sistemde yüklü olmayan fontlar atlanır.
+fallback = [
+    "Symbols Nerd Font Mono",
+    "Symbols Nerd Font",
+    "JetBrainsMono Nerd Font Mono",
+    "MesloLGS Nerd Font",
+    "Noto Sans Symbols",
+    "Noto Color Emoji",
+]
+
+[colors]
+foreground = "#cccccc"
+background = "#1e1e1e"
+cursor = "#ffffff"
+
+[terminal]
+scrollback_lines = 10000
+shell = ""
+
+[bell]
+visual = true
+
+[appearance]
+theme = "auto"
+opacity = 1.0
