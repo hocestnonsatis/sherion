@@ -6,7 +6,11 @@ use crate::tabs::TabId;
 
 #[derive(Debug, Clone)]
 pub enum UserEvent {
-    Terminal { tab_id: TabId, event: TerminalEvent },
+    Terminal {
+        window_id: WindowId,
+        tab_id: TabId,
+        event: TerminalEvent,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -30,6 +34,7 @@ impl EventProxy {
 impl EventListener for EventProxy {
     fn send_event(&self, event: TerminalEvent) {
         let _ = self.proxy.send_event(UserEvent::Terminal {
+            window_id: self.window_id,
             tab_id: self.tab_id,
             event,
         });

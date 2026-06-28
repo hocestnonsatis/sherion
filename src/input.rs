@@ -5,10 +5,13 @@ use winit::keyboard::{Key, ModifiersState, NamedKey};
 pub enum KeyAction {
     SendToTerminal(Vec<u8>),
     NewTab,
+    DuplicateTab,
     CloseTab,
+    DetachTab,
     NextTab,
     PrevTab,
     SelectTab(usize),
+    RenameTab,
     Copy,
     Paste,
     ZoomIn,
@@ -28,7 +31,9 @@ pub fn key_event_to_action(event: &KeyEvent, modifiers: ModifiersState) -> Optio
     if ctrl && shift {
         return match &event.logical_key {
             Key::Character(text) if text.eq_ignore_ascii_case("t") => Some(KeyAction::NewTab),
+            Key::Character(text) if text.eq_ignore_ascii_case("d") => Some(KeyAction::DuplicateTab),
             Key::Character(text) if text.eq_ignore_ascii_case("w") => Some(KeyAction::CloseTab),
+            Key::Character(text) if text.eq_ignore_ascii_case("n") => Some(KeyAction::DetachTab),
             Key::Character(text) if text.eq_ignore_ascii_case("c") => Some(KeyAction::Copy),
             Key::Character(text) if text.eq_ignore_ascii_case("v") => Some(KeyAction::Paste),
             Key::Character(text) if text.eq_ignore_ascii_case("k") => {
@@ -44,6 +49,10 @@ pub fn key_event_to_action(event: &KeyEvent, modifiers: ModifiersState) -> Optio
         if let Key::Named(NamedKey::Insert) = &event.logical_key {
             return Some(KeyAction::Paste);
         }
+    }
+
+    if let Key::Named(NamedKey::F2) = &event.logical_key {
+        return Some(KeyAction::RenameTab);
     }
 
     if ctrl {

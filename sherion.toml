@@ -4,8 +4,6 @@ title = "Sherion"
 [font]
 family = "DejaVu Sans Mono"
 size = 14.0
-# Birincil fontta glyph bulunamazsa (ör. ls/exa Nerd Font ikonları) sırayla denenir.
-# Sistemde yüklü olmayan fontlar atlanır.
 fallback = [
     "Symbols Nerd Font Mono",
     "Symbols Nerd Font",
@@ -30,3 +28,13 @@ visual = true
 [appearance]
 theme = "auto"
 opacity = 1.0
+
+[ui]
+font_zoom = 1.0
+sidebar_width = 157.1796875
+sidebar_collapsed = false
+view_mode = "single"
+
+[session]
+restore_tabs = false
+cwd = ["/home/anilo/Projeler/sherion"]

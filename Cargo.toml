@@ -6,6 +6,14 @@ description = "A high-performance Rust terminal emulator"
 license = "MIT"
 rust-version = "1.88"
 
+[lib]
+name = "sherion"
+path = "src/lib.rs"
+
+[[bin]]
+name = "sherion"
+path = "src/main.rs"
+
 [dependencies]
 alacritty_terminal = "0.26"
 arboard = "3"
@@ -21,3 +29,4 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 vello = "0.9"
 wgpu = "29"
 winit = "0.30"
+libc = "0.2.186"

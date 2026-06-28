@@ -1,7 +1,5 @@
-use std::sync::Arc;
-
-use alacritty_terminal::sync::FairMutex;
-use alacritty_terminal::term::Term;
+use std::path::PathBuf;
+use std::time::Instant;
 
 use crate::config::Config;
 use crate::event::EventProxy;
@@ -15,33 +13,42 @@ pub struct Tab {
     pub id: TabId,
     pub title: String,
     pub session: PtySession,
+    /// When the tab's foreground process started running, if it is busy.
+    /// `None` means the tab is idle at the shell prompt.
+    pub running_since: Option<Instant>,
+}
+
+/// A lightweight snapshot of a tab used to build the sidebar entries.
+pub struct TabInfo {
+    pub id: TabId,
+    pub title: String,
+    pub cwd: Option<PathBuf>,
+    pub active: bool,
+    pub running_since: Option<Instant>,
 }
 
 pub struct TabManager {
     tabs: Vec<Tab>,
     active: usize,
-    next_id: usize,
 }
 
 impl TabManager {
+    pub fn empty() -> Self {
+        Self {
+            tabs: Vec::new(),
+            active: 0,
+        }
+    }
+
     pub fn with_initial(tab: Tab) -> Self {
         Self {
             tabs: vec![tab],
             active: 0,
-            next_id: 1,
         }
-    }
-
-    pub fn len(&self) -> usize {
-        self.tabs.len()
     }
 
     pub fn is_empty(&self) -> bool {
         self.tabs.is_empty()
-    }
-
-    pub fn active_index(&self) -> usize {
-        self.active
     }
 
     pub fn active_id(&self) -> Option<TabId> {
@@ -50,11 +57,6 @@ impl TabManager {
 
     pub fn active_tab(&self) -> Option<&Tab> {
         self.tabs.get(self.active)
-    }
-
-    pub fn active_tab_mut(&mut self) -> Option<&mut Tab> {
-        let active = self.active;
-        self.tabs.get_mut(active)
     }
 
     pub fn tab_by_id(&self, id: TabId) -> Option<&Tab> {
@@ -69,11 +71,17 @@ impl TabManager {
         self.tabs.iter().position(|tab| tab.id == id)
     }
 
-    pub fn titles(&self) -> Vec<(TabId, String, bool)> {
+    pub fn infos(&self) -> Vec<TabInfo> {
         self.tabs
             .iter()
             .enumerate()
-            .map(|(index, tab)| (tab.id, tab.title.clone(), index == self.active))
+            .map(|(index, tab)| TabInfo {
+                id: tab.id,
+                title: tab.title.clone(),
+                cwd: tab.session.current_working_directory(),
+                active: index == self.active,
+                running_since: tab.running_since,
+            })
             .collect()
     }
 
@@ -82,16 +90,33 @@ impl TabManager {
         config: &Config,
         layout: TerminalLayout,
         proxy: EventLoopProxyFactory,
+        next_tab_id: &mut usize,
+        working_directory: Option<PathBuf>,
     ) -> Option<TabId> {
-        let id = TabId(self.next_id);
-        self.next_id += 1;
+        let id = TabId(*next_tab_id);
+        *next_tab_id += 1;
 
         let event_proxy = proxy.for_tab(id);
         let title = format!("Tab {}", id.0);
-        tracing::info!(cols = layout.cols, rows = layout.rows, "spawning new tab");
-        match PtySession::spawn(config, layout, event_proxy) {
+        tracing::info!(
+            cols = layout.cols,
+            rows = layout.rows,
+            cwd = ?working_directory,
+            "spawning new tab"
+        );
+        match PtySession::spawn_with_working_directory(
+            config,
+            layout,
+            event_proxy,
+            working_directory,
+        ) {
             Ok(session) => {
-                let tab = Tab { id, title, session };
+                let tab = Tab {
+                    id,
+                    title,
+                    session,
+                    running_since: None,
+                };
                 self.tabs.push(tab);
                 let index = self.tabs.len() - 1;
                 self.active = index;
@@ -123,6 +148,37 @@ impl TabManager {
         }
 
         true
+    }
+
+    pub fn take_tab(&mut self, id: TabId) -> Option<Tab> {
+        let index = self.tab_index(id)?;
+        let tab = self.tabs.remove(index);
+
+        if self.tabs.is_empty() {
+            self.active = 0;
+        } else if self.active >= self.tabs.len() {
+            self.active = self.tabs.len() - 1;
+        } else if index < self.active {
+            self.active -= 1;
+        }
+
+        Some(tab)
+    }
+
+    pub fn active_index(&self) -> usize {
+        self.active
+    }
+
+    pub fn len(&self) -> usize {
+        self.tabs.len()
+    }
+
+    pub fn tab_at_index(&self, index: usize) -> Option<&Tab> {
+        self.tabs.get(index)
+    }
+
+    pub fn tab_at_index_mut(&mut self, index: usize) -> Option<&mut Tab> {
+        self.tabs.get_mut(index)
     }
 
     pub fn set_active(&mut self, id: TabId) -> bool {
@@ -168,11 +224,6 @@ impl TabManager {
         if let Some(tab) = self.tab_by_id_mut(id) {
             tab.title = fallback.to_owned();
         }
-    }
-
-    pub fn active_terminal(&self) -> Option<Arc<FairMutex<Term<EventProxy>>>> {
-        self.active_tab()
-            .map(|tab| Arc::clone(&tab.session.terminal))
     }
 
     pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut Tab> {

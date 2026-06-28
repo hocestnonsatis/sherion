@@ -1,11 +1,4 @@
-mod app;
-mod clipboard;
-mod config;
-mod event;
-mod input;
-mod pty;
-mod render;
-mod tabs;
+#![allow(clippy::too_many_arguments)]
 
 use anyhow::Result;
 use tracing_subscriber::EnvFilter;
@@ -15,6 +8,6 @@ fn main() -> Result<()> {
         .with_env_filter(EnvFilter::from_default_env().add_directive("sherion=info".parse()?))
         .init();
 
-    let config = config::Config::load()?;
-    app::App::run(config)
+    let config = sherion::config::Config::load()?;
+    sherion::app::App::run(config)
 }

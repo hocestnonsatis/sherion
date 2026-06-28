@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use parley::layout::PositionedLayoutItem;
 use parley::{
     Alignment, AlignmentOptions, FontFamily, FontFamilyName, LayoutContext, LineHeight,
@@ -10,11 +12,24 @@ use vello::Scene;
 use crate::config::Config;
 
 pub fn font_family_from_config(config: &Config) -> FontFamily<'static> {
+    let mut names = Vec::new();
+
+    // Chrome text is UI, not terminal grid text. Prefer a proportional system
+    // face for sharper small labels, then fall back to the configured terminal
+    // font so symbols/icons still resolve consistently.
+    names.push(FontFamilyName::Generic(parley::GenericFamily::SansSerif));
+
     if let Some(parsed) = FontFamilyName::parse(&config.font.family) {
-        FontFamily::Single(parsed.into_owned())
-    } else {
-        FontFamily::Single(FontFamilyName::Generic(parley::GenericFamily::Monospace))
+        names.push(parsed.into_owned());
     }
+    for fallback in &config.font.fallback {
+        if let Some(parsed) = FontFamilyName::parse(fallback) {
+            names.push(parsed.into_owned());
+        }
+    }
+    names.push(FontFamilyName::Generic(parley::GenericFamily::Monospace));
+
+    FontFamily::List(Cow::Owned(names))
 }
 
 pub fn draw_text(
@@ -32,6 +47,11 @@ pub fn draw_text(
     if text.is_empty() {
         return;
     }
+
+    let x = x.round();
+    let y_top = y_top.round();
+    let font_size = font_size.round().max(1.0);
+    let max_width = max_width.map(|width| width.round().max(1.0));
 
     let mut builder = layout_cx.ranged_builder(font_cx, text, 1.0, true);
     builder.push_default(StyleProperty::FontSize(font_size));

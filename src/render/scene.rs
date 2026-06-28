@@ -2,21 +2,27 @@ use alacritty_terminal::index::Point;
 use alacritty_terminal::selection::SelectionRange;
 use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::color::Colors;
-use alacritty_terminal::term::{point_to_viewport, RenderableContent, RenderableCursor};
+use alacritty_terminal::term::{point_to_viewport, RenderableCursor};
 use alacritty_terminal::vte::ansi::{Color, CursorShape, NamedColor, Rgb};
 use parley::layout::PositionedLayoutItem;
-use parley::{
-    FontFamily, FontFamilyName, FontWeight, LayoutContext, LineHeight, StyleProperty,
-};
+use parley::{FontFamily, FontFamilyName, FontWeight, LayoutContext, LineHeight, StyleProperty};
 use vello::kurbo::{Affine, Rect};
+use vello::peniko::color::AlphaColor;
 use vello::peniko::{Brush, Fill};
 use vello::Scene;
 
 use crate::config::Config;
+use crate::render::frame::{FrameDamage, SearchMatch, TerminalFrame};
+use crate::render::glyph_cache::{
+    cache_layout_glyphs, emit_cached_glyphs, emit_glyph_run, GlyphCache, GlyphCacheKey,
+};
 use crate::render::TerminalLayout;
 
 pub struct SceneBuilder {
     pub layout_cx: LayoutContext<Brush>,
+    text_buf: String,
+    font_family: Option<FontFamily<'static>>,
+    glyph_cache: GlyphCache,
 }
 
 #[derive(Clone)]
@@ -27,144 +33,203 @@ struct GlyphStyle {
     underline: bool,
 }
 
+impl GlyphStyle {
+    fn from_cell(
+        cell: &Cell,
+        point: Point,
+        colors: &Colors,
+        default_fg: &Brush,
+        default_bg: &Brush,
+        selection: Option<SelectionRange>,
+        search_matches: &[SearchMatch],
+        search_active: Option<usize>,
+        link_hovers: &[SearchMatch],
+        row: usize,
+    ) -> Self {
+        let col = point.column.0;
+        let mut fg = cell_foreground(cell, point, colors, default_fg, default_bg, selection);
+        let mut underline = cell.flags.contains(Flags::UNDERLINE);
+
+        if link_match_contains(link_hovers, row, col) {
+            fg = link_foreground_brush();
+            underline = true;
+        } else if search_active_match_contains(search_matches, search_active, row, col) {
+            fg = search_active_foreground_brush();
+        } else if search_match_contains(search_matches, row, col) {
+            fg = search_foreground_brush();
+        }
+
+        Self {
+            fg,
+            bold: cell
+                .flags
+                .intersects(Flags::BOLD | Flags::BOLD_ITALIC | Flags::DIM_BOLD),
+            italic: cell.flags.intersects(Flags::ITALIC | Flags::BOLD_ITALIC),
+            underline,
+        }
+    }
+}
+
 impl SceneBuilder {
     pub fn new() -> Self {
         Self {
             layout_cx: LayoutContext::new(),
+            text_buf: String::with_capacity(256),
+            font_family: None,
+            glyph_cache: GlyphCache::new(),
         }
     }
 
-    pub fn build(
+    pub fn invalidate_font_cache(&mut self) {
+        self.font_family = None;
+        self.glyph_cache.clear();
+    }
+
+    pub fn update_terminal(
         &mut self,
         scene: &mut Scene,
-        content: RenderableContent<'_>,
+        frame: &TerminalFrame,
         layout: TerminalLayout,
         config: &Config,
         font_cx: &mut parley::FontContext,
         terminal_opacity: f32,
+        damage: &FrameDamage,
     ) {
         let default_fg: Brush = config.foreground_brush().into();
         let default_bg: Brush = config.background_brush().into();
         let cursor_brush: Brush = config.cursor_brush().into();
         let x_off = f64::from(layout.content_offset_x);
         let y_off = f64::from(layout.content_offset_y);
-
-        let width = f64::from(layout.cell_width) * f64::from(layout.cols);
-        let height = f64::from(layout.cell_height) * f64::from(layout.rows);
-
-        scene.fill(
-            Fill::NonZero,
-            Affine::IDENTITY,
-            &with_opacity(default_bg.clone(), terminal_opacity),
-            None,
-            &Rect::new(x_off, y_off, x_off + width, y_off + height),
-        );
-
-        let row_count = layout.rows as usize;
         let col_count = layout.cols as usize;
-        let display_offset = content.display_offset;
-        let selection = content.selection;
-        let mut rows: Vec<Vec<(Point, Cell)>> = vec![Vec::new(); row_count];
-        let mut cursor_cell: Option<Cell> = None;
+        let selection = frame.selection;
+        let search_matches = frame.search_matches.as_slice();
+        let search_active = frame.search_active_match;
+        let link_hovers = frame.link_hovers.as_slice();
+        let colors = &frame.colors;
+        let row_count = layout.rows as usize;
+        let bg_opaque = with_opacity(default_bg.clone(), terminal_opacity);
 
-        for indexed in content.display_iter {
-            if indexed.cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
-                continue;
-            }
-
-            let point = indexed.point;
-            let Some(viewport) = point_to_viewport(display_offset, point) else {
-                continue;
-            };
-            let row = viewport.line;
-            if row >= row_count {
-                continue;
-            }
-
-            let col = point.column.0;
-            if col >= col_count {
-                continue;
-            }
-
-            let cell = indexed.cell.clone();
-
-            if point == content.cursor.point {
-                cursor_cell = Some(cell.clone());
-            }
-
-            let (mut fg, mut bg) =
-                resolved_colors(&cell, content.colors, &default_fg, &default_bg);
-            apply_cell_colors(&mut fg, &mut bg, &cell, point, selection);
-
-            // Window transparency follows the kitty/alacritty model: the opacity
-            // only thins the default background, which is already painted once by
-            // the full-grid fill above. Cells that keep the default background add
-            // no per-cell fill (so two translucent layers can't stack and wash out
-            // the effect), while explicitly colored cells stay fully opaque so
-            // color blocks and selections remain solid.
-            if !brush_solid_eq(&bg, &default_bg) {
-                let col = point.column.0;
-                // Snap background rectangles to integer pixel boundaries so adjacent
-                // cells share an identical edge. Without this the fractional cell
-                // width leaves anti-aliased seams between solid color blocks
-                // (e.g. fastfetch's palette row).
-                let x0 = (x_off + col as f64 * f64::from(layout.cell_width)).round();
-                let x1 = (x_off + (col + 1) as f64 * f64::from(layout.cell_width)).round();
-                let y0 = (y_off + row as f64 * f64::from(layout.cell_height)).round();
-                let y1 = (y_off + (row + 1) as f64 * f64::from(layout.cell_height)).round();
-
-                scene.fill(
-                    Fill::NonZero,
-                    Affine::IDENTITY,
-                    &bg,
-                    None,
-                    &Rect::new(x0, y0, x1, y1),
-                );
-            }
-
-            rows[row].push((point, cell));
+        if damage.is_unchanged() {
+            return;
         }
 
-        for (row, mut cells) in rows.into_iter().enumerate() {
-            if cells.is_empty() {
-                continue;
-            }
-            cells.sort_by_key(|(point, _)| point.column.0);
-            self.render_row(
-                scene,
-                font_cx,
-                row,
-                &cells,
-                layout,
-                config,
-                &default_fg,
-                &default_bg,
-                content.colors,
-                selection,
+        if damage.is_full() {
+            scene.reset();
+
+            let width = f64::from(layout.cell_width) * f64::from(layout.cols);
+            let height = f64::from(layout.cell_height) * f64::from(layout.rows);
+            scene.fill(
+                Fill::NonZero,
+                Affine::IDENTITY,
+                &bg_opaque,
+                None,
+                &Rect::new(x_off, y_off, x_off + width, y_off + height),
             );
-        }
 
-        self.render_cursor(
-            scene,
-            content.cursor,
-            display_offset,
-            layout,
-            &cursor_brush,
-        );
-
-        if content.cursor.shape == CursorShape::Block {
-            if let Some(cell) = cursor_cell {
-                self.render_cursor_glyph(
+            for (row, cells) in frame.rows.iter().enumerate() {
+                if !cells.is_empty() {
+                    fill_row_backgrounds(
+                        scene,
+                        row,
+                        cells,
+                        layout,
+                        x_off,
+                        y_off,
+                        col_count,
+                        colors,
+                        &default_fg,
+                        &default_bg,
+                        selection,
+                        search_matches,
+                        search_active,
+                        link_hovers,
+                    );
+                }
+                self.render_row(
                     scene,
                     font_cx,
-                    content.cursor,
-                    display_offset,
-                    &cell,
+                    row,
+                    cells,
                     layout,
                     config,
                     &default_fg,
                     &default_bg,
-                    content.colors,
+                    colors,
+                    selection,
+                    search_matches,
+                    search_active,
+                    link_hovers,
+                );
+            }
+        } else if let Some(lines) = damage.damaged_lines() {
+            for bounds in lines {
+                if bounds.line >= row_count {
+                    continue;
+                }
+                clear_row_band(scene, bounds.line, layout, x_off, y_off, &bg_opaque);
+                let cells = &frame.rows[bounds.line];
+                if !cells.is_empty() {
+                    fill_row_backgrounds(
+                        scene,
+                        bounds.line,
+                        cells,
+                        layout,
+                        x_off,
+                        y_off,
+                        col_count,
+                        colors,
+                        &default_fg,
+                        &default_bg,
+                        selection,
+                        search_matches,
+                        search_active,
+                        link_hovers,
+                    );
+                }
+                self.render_row(
+                    scene,
+                    font_cx,
+                    bounds.line,
+                    cells,
+                    layout,
+                    config,
+                    &default_fg,
+                    &default_bg,
+                    colors,
+                    selection,
+                    search_matches,
+                    search_active,
+                    link_hovers,
+                );
+            }
+        }
+
+        self.render_cursor(
+            scene,
+            frame.cursor,
+            frame.display_offset,
+            layout,
+            &cursor_brush,
+            frame
+                .cursor_cell
+                .as_ref()
+                .map(cell_column_span)
+                .unwrap_or(1),
+        );
+
+        if frame.cursor.shape == CursorShape::Block {
+            if let Some(cell) = frame.cursor_cell.as_ref() {
+                self.render_cursor_glyph(
+                    scene,
+                    font_cx,
+                    frame.cursor,
+                    frame.display_offset,
+                    cell,
+                    layout,
+                    config,
+                    &default_fg,
+                    &default_bg,
+                    colors,
                     selection,
                 );
             }
@@ -183,6 +248,9 @@ impl SceneBuilder {
         default_bg: &Brush,
         colors: &Colors,
         selection: Option<SelectionRange>,
+        search_matches: &[SearchMatch],
+        search_active: Option<usize>,
+        link_hovers: &[SearchMatch],
     ) {
         let x_off = f64::from(layout.content_offset_x);
         let y_off = f64::from(layout.content_offset_y);
@@ -190,6 +258,11 @@ impl SceneBuilder {
         let cell_w = f64::from(layout.cell_width);
         let max_cols = layout.cols as usize;
 
+        // Each cell is shaped and drawn at its own grid position. Coalescing a
+        // run into a single Parley layout makes glyphs advance by the font's
+        // natural width instead of the fixed `cell_width`, which accumulates a
+        // horizontal drift across the row. Per-cell placement keeps the
+        // monospace grid exact.
         for (point, cell) in cells {
             let col = point.column.0;
             if col >= max_cols {
@@ -200,31 +273,27 @@ impl SceneBuilder {
                 continue;
             }
 
-            let fg = cell_foreground(cell, *point, colors, default_fg, default_bg, selection);
-            let mut text = String::new();
-            text.push(cell.c);
-            if let Some(zerowidth) = cell.zerowidth() {
-                text.extend(zerowidth);
-            }
+            let style = GlyphStyle::from_cell(
+                cell,
+                *point,
+                colors,
+                default_fg,
+                default_bg,
+                selection,
+                search_matches,
+                search_active,
+                link_hovers,
+                row,
+            );
+
+            self.text_buf.clear();
+            push_cell_text(&mut self.text_buf, cell);
+            let text = std::mem::take(&mut self.text_buf);
 
             let x = x_off + col as f64 * cell_w;
-            self.draw_glyph_text(
-                scene,
-                font_cx,
-                &text,
-                x,
-                y,
-                layout,
-                config,
-                GlyphStyle {
-                    fg,
-                    bold: cell.flags.intersects(Flags::BOLD | Flags::BOLD_ITALIC | Flags::DIM_BOLD),
-                    italic: cell
-                        .flags
-                        .intersects(Flags::ITALIC | Flags::BOLD_ITALIC),
-                    underline: cell.flags.contains(Flags::UNDERLINE),
-                },
-            );
+            self.draw_glyph_text(scene, font_cx, &text, x, y, layout, config, style);
+
+            self.text_buf = text;
         }
     }
 
@@ -243,16 +312,33 @@ impl SceneBuilder {
             return;
         }
 
+        let cache_key = GlyphCacheKey::new(
+            text,
+            style.bold,
+            style.italic,
+            style.underline,
+            layout.font_size,
+        );
+
+        if let Some(cached) = self.glyph_cache.get(&cache_key) {
+            emit_cached_glyphs(scene, cached, &style.fg, x, y);
+            return;
+        }
+
+        let font_family = self.font_family(config).clone();
         let transform = Affine::translate((x, y));
         let mut builder = self.layout_cx.ranged_builder(font_cx, text, 1.0, true);
         builder.push_default(StyleProperty::FontSize(layout.font_size));
-        builder.push_default(StyleProperty::FontFamily(config_font_family(config)));
-        builder.push_default(StyleProperty::Brush(style.fg));
+        builder.push_default(StyleProperty::FontFamily(font_family));
+        builder.push_default(StyleProperty::Brush(style.fg.clone()));
         builder.push_default(StyleProperty::LineHeight(LineHeight::FontSizeRelative(1.0)));
 
         let range = 0..text.len();
         if style.bold {
-            builder.push(StyleProperty::FontWeight(FontWeight::new(700.0)), range.clone());
+            builder.push(
+                StyleProperty::FontWeight(FontWeight::new(700.0)),
+                range.clone(),
+            );
         }
         if style.italic {
             builder.push(
@@ -266,46 +352,28 @@ impl SceneBuilder {
 
         let mut text_layout = builder.build(text);
         text_layout.break_all_lines(None);
+
+        if let Some(cached) = cache_layout_glyphs(&text_layout) {
+            self.glyph_cache.insert(cache_key, cached.clone());
+            emit_cached_glyphs(scene, &cached, &style.fg, x, y);
+            return;
+        }
+
         for line in text_layout.lines() {
             for item in line.items() {
                 let PositionedLayoutItem::GlyphRun(glyph_run) = item else {
                     continue;
                 };
-
-                let brush = glyph_run.style().brush.clone();
-                let mut glyph_x = glyph_run.offset();
-                let glyph_y = glyph_run.baseline();
-                let run = glyph_run.run();
-                let font = run.font();
-                let font_size = run.font_size();
-                let synthesis = run.synthesis();
-                let glyph_xform = synthesis
-                    .skew()
-                    .map(|angle| Affine::skew(angle.to_radians().tan() as f64, 0.0));
-
-                scene
-                    .draw_glyphs(font)
-                    .brush(&brush)
-                    .hint(true)
-                    .transform(transform)
-                    .glyph_transform(glyph_xform)
-                    .font_size(font_size)
-                    .normalized_coords(run.normalized_coords())
-                    .draw(
-                        Fill::NonZero,
-                        glyph_run.glyphs().map(|glyph| {
-                            let gx = glyph_x + glyph.x;
-                            let gy = glyph_y + glyph.y;
-                            glyph_x += glyph.advance;
-                            vello::Glyph {
-                                id: glyph.id,
-                                x: gx,
-                                y: gy,
-                            }
-                        }),
-                    );
+                emit_glyph_run(scene, glyph_run, transform);
             }
         }
+    }
+
+    fn font_family(&mut self, config: &Config) -> &FontFamily<'static> {
+        if self.font_family.is_none() {
+            self.font_family = Some(config_font_family(config));
+        }
+        self.font_family.as_ref().unwrap()
     }
 
     fn render_cursor_glyph(
@@ -343,7 +411,11 @@ impl SceneBuilder {
         let y_off = f64::from(layout.content_offset_y);
         let y = y_off + row as f64 * f64::from(layout.cell_height);
         let x = x_off + col as f64 * f64::from(layout.cell_width);
-        let text: String = cell.c.to_string();
+
+        self.text_buf.clear();
+        self.text_buf.push(cell.c);
+        let text = std::mem::take(&mut self.text_buf);
+
         self.draw_glyph_text(
             scene,
             font_cx,
@@ -354,13 +426,15 @@ impl SceneBuilder {
             config,
             GlyphStyle {
                 fg,
-                bold: cell.flags.intersects(Flags::BOLD | Flags::BOLD_ITALIC | Flags::DIM_BOLD),
-                italic: cell
+                bold: cell
                     .flags
-                    .intersects(Flags::ITALIC | Flags::BOLD_ITALIC),
+                    .intersects(Flags::BOLD | Flags::BOLD_ITALIC | Flags::DIM_BOLD),
+                italic: cell.flags.intersects(Flags::ITALIC | Flags::BOLD_ITALIC),
                 underline: cell.flags.contains(Flags::UNDERLINE),
             },
         );
+
+        self.text_buf = text;
     }
 
     fn render_cursor(
@@ -370,6 +444,7 @@ impl SceneBuilder {
         display_offset: usize,
         layout: TerminalLayout,
         cursor_brush: &Brush,
+        cell_span: usize,
     ) {
         if cursor.shape == CursorShape::Hidden {
             return;
@@ -388,7 +463,7 @@ impl SceneBuilder {
         let y_off = f64::from(layout.content_offset_y);
         let x = x_off + col as f64 * f64::from(layout.cell_width);
         let y = y_off + row as f64 * f64::from(layout.cell_height);
-        let cell_w = f64::from(layout.cell_width);
+        let cell_w = f64::from(layout.cell_width) * cell_span as f64;
         let cell_h = f64::from(layout.cell_height);
 
         match cursor.shape {
@@ -431,6 +506,170 @@ impl SceneBuilder {
             }
             CursorShape::Hidden => {}
         }
+    }
+}
+
+fn clear_row_band(
+    scene: &mut Scene,
+    row: usize,
+    layout: TerminalLayout,
+    x_off: f64,
+    y_off: f64,
+    bg: &Brush,
+) {
+    let y0 = (y_off + row as f64 * f64::from(layout.cell_height)).round();
+    let y1 = (y_off + (row + 1) as f64 * f64::from(layout.cell_height)).round();
+    let x0 = x_off.round();
+    let x1 = (x_off + f64::from(layout.cell_width) * f64::from(layout.cols)).round();
+    scene.fill(
+        Fill::NonZero,
+        Affine::IDENTITY,
+        bg,
+        None,
+        &Rect::new(x0, y0, x1, y1),
+    );
+}
+
+fn fill_row_backgrounds(
+    scene: &mut Scene,
+    row: usize,
+    cells: &[(Point, Cell)],
+    layout: TerminalLayout,
+    x_off: f64,
+    y_off: f64,
+    col_count: usize,
+    colors: &Colors,
+    default_fg: &Brush,
+    default_bg: &Brush,
+    selection: Option<SelectionRange>,
+    search_matches: &[SearchMatch],
+    search_active: Option<usize>,
+    _link_hovers: &[SearchMatch],
+) {
+    let cell_w = f64::from(layout.cell_width);
+    let y0 = (y_off + row as f64 * f64::from(layout.cell_height)).round();
+    let y1 = (y_off + (row + 1) as f64 * f64::from(layout.cell_height)).round();
+
+    let mut segments: Vec<(usize, usize, Brush)> = Vec::new();
+    for (point, cell) in cells {
+        let col = point.column.0;
+        if col >= col_count {
+            continue;
+        }
+
+        let (mut fg, mut bg) = resolved_colors(cell, colors, default_fg, default_bg);
+        apply_cell_colors(&mut fg, &mut bg, cell, *point, selection);
+        if search_active_match_contains(search_matches, search_active, row, col) {
+            bg = search_active_background_brush();
+        } else if search_match_contains(search_matches, row, col) {
+            bg = search_background_brush();
+        }
+
+        if brush_solid_eq(&bg, default_bg) {
+            continue;
+        }
+
+        let span = cell_column_span(cell);
+        segments.push((col, span, bg));
+    }
+
+    if segments.is_empty() {
+        return;
+    }
+
+    segments.sort_by_key(|(col, _, _)| *col);
+
+    let mut run_start = segments[0].0;
+    let mut run_end = segments[0].0 + segments[0].1;
+    let mut run_bg = segments[0].2.clone();
+
+    for (col, span, bg) in segments.into_iter().skip(1) {
+        if brush_solid_eq(&bg, &run_bg) && col == run_end {
+            run_end = col + span;
+        } else {
+            let x0 = (x_off + run_start as f64 * cell_w).round();
+            let x1 = (x_off + run_end as f64 * cell_w).round();
+            scene.fill(
+                Fill::NonZero,
+                Affine::IDENTITY,
+                &run_bg,
+                None,
+                &Rect::new(x0, y0, x1, y1),
+            );
+            run_start = col;
+            run_end = col + span;
+            run_bg = bg;
+        }
+    }
+
+    let x0 = (x_off + run_start as f64 * cell_w).round();
+    let x1 = (x_off + run_end as f64 * cell_w).round();
+    scene.fill(
+        Fill::NonZero,
+        Affine::IDENTITY,
+        &run_bg,
+        None,
+        &Rect::new(x0, y0, x1, y1),
+    );
+}
+
+fn search_match_contains(matches: &[SearchMatch], row: usize, col: usize) -> bool {
+    matches
+        .iter()
+        .any(|m| m.row == row && col >= m.start_col && col < m.end_col)
+}
+
+fn search_active_match_contains(
+    matches: &[SearchMatch],
+    active: Option<usize>,
+    row: usize,
+    col: usize,
+) -> bool {
+    active.is_some_and(|index| {
+        matches
+            .get(index)
+            .is_some_and(|m| m.row == row && col >= m.start_col && col < m.end_col)
+    })
+}
+
+fn link_match_contains(matches: &[SearchMatch], row: usize, col: usize) -> bool {
+    matches
+        .iter()
+        .any(|m| m.row == row && col >= m.start_col && col < m.end_col)
+}
+
+fn search_background_brush() -> Brush {
+    Brush::Solid(AlphaColor::from_rgba8(255, 214, 102, 210))
+}
+
+fn search_active_background_brush() -> Brush {
+    Brush::Solid(AlphaColor::from_rgba8(255, 168, 40, 230))
+}
+
+fn search_foreground_brush() -> Brush {
+    Brush::Solid(AlphaColor::from_rgba8(20, 20, 20, 255))
+}
+
+fn search_active_foreground_brush() -> Brush {
+    Brush::Solid(AlphaColor::from_rgba8(255, 255, 255, 255))
+}
+
+fn link_foreground_brush() -> Brush {
+    Brush::Solid(AlphaColor::from_rgba8(120, 180, 255, 255))
+}
+
+fn cell_column_span(cell: &Cell) -> usize {
+    if cell.flags.contains(Flags::WIDE_CHAR) {
+        2
+    } else {
+        1
+    }
+}
+
+fn push_cell_text(buf: &mut String, cell: &Cell) {
+    buf.push(cell.c);
+    if let Some(zerowidth) = cell.zerowidth() {
+        buf.extend(zerowidth);
     }
 }
 
@@ -490,12 +729,7 @@ fn resolved_colors(
     )
 }
 
-fn color_to_brush(
-    color: Color,
-    colors: &Colors,
-    fallback: Brush,
-    is_foreground: bool,
-) -> Brush {
+fn color_to_brush(color: Color, colors: &Colors, fallback: Brush, is_foreground: bool) -> Brush {
     match color {
         Color::Spec(rgb) => brush_from_rgb(rgb),
         Color::Named(named) => match named {
@@ -512,7 +746,9 @@ fn color_to_brush(
 }
 
 fn brush_from_rgb(rgb: Rgb) -> Brush {
-    Brush::Solid(vello::peniko::color::AlphaColor::from_rgb8(rgb.r, rgb.g, rgb.b))
+    Brush::Solid(vello::peniko::color::AlphaColor::from_rgb8(
+        rgb.r, rgb.g, rgb.b,
+    ))
 }
 
 fn brush_solid_eq(a: &Brush, b: &Brush) -> bool {
@@ -540,25 +776,101 @@ fn with_opacity(brush: Brush, opacity: f32) -> Brush {
 fn named_fallback(named: NamedColor) -> Rgb {
     match named {
         NamedColor::Black => Rgb { r: 0, g: 0, b: 0 },
-        NamedColor::Red => Rgb { r: 205, g: 49, b: 49 },
-        NamedColor::Green => Rgb { r: 13, g: 188, b: 121 },
-        NamedColor::Yellow => Rgb { r: 229, g: 229, b: 16 },
-        NamedColor::Blue => Rgb { r: 36, g: 114, b: 200 },
-        NamedColor::Magenta => Rgb { r: 188, g: 63, b: 188 },
-        NamedColor::Cyan => Rgb { r: 17, g: 168, b: 205 },
-        NamedColor::White => Rgb { r: 229, g: 229, b: 229 },
-        NamedColor::BrightBlack => Rgb { r: 102, g: 102, b: 102 },
-        NamedColor::BrightRed => Rgb { r: 241, g: 76, b: 76 },
-        NamedColor::BrightGreen => Rgb { r: 35, g: 209, b: 139 },
-        NamedColor::BrightYellow => Rgb { r: 245, g: 245, b: 67 },
-        NamedColor::BrightBlue => Rgb { r: 59, g: 142, b: 234 },
-        NamedColor::BrightMagenta => Rgb { r: 214, g: 112, b: 214 },
-        NamedColor::BrightCyan => Rgb { r: 41, g: 184, b: 219 },
-        NamedColor::BrightWhite => Rgb { r: 255, g: 255, b: 255 },
-        NamedColor::Foreground => Rgb { r: 204, g: 204, b: 204 },
-        NamedColor::Background => Rgb { r: 30, g: 30, b: 30 },
-        NamedColor::Cursor => Rgb { r: 255, g: 255, b: 255 },
-        _ => Rgb { r: 204, g: 204, b: 204 },
+        NamedColor::Red => Rgb {
+            r: 205,
+            g: 49,
+            b: 49,
+        },
+        NamedColor::Green => Rgb {
+            r: 13,
+            g: 188,
+            b: 121,
+        },
+        NamedColor::Yellow => Rgb {
+            r: 229,
+            g: 229,
+            b: 16,
+        },
+        NamedColor::Blue => Rgb {
+            r: 36,
+            g: 114,
+            b: 200,
+        },
+        NamedColor::Magenta => Rgb {
+            r: 188,
+            g: 63,
+            b: 188,
+        },
+        NamedColor::Cyan => Rgb {
+            r: 17,
+            g: 168,
+            b: 205,
+        },
+        NamedColor::White => Rgb {
+            r: 229,
+            g: 229,
+            b: 229,
+        },
+        NamedColor::BrightBlack => Rgb {
+            r: 102,
+            g: 102,
+            b: 102,
+        },
+        NamedColor::BrightRed => Rgb {
+            r: 241,
+            g: 76,
+            b: 76,
+        },
+        NamedColor::BrightGreen => Rgb {
+            r: 35,
+            g: 209,
+            b: 139,
+        },
+        NamedColor::BrightYellow => Rgb {
+            r: 245,
+            g: 245,
+            b: 67,
+        },
+        NamedColor::BrightBlue => Rgb {
+            r: 59,
+            g: 142,
+            b: 234,
+        },
+        NamedColor::BrightMagenta => Rgb {
+            r: 214,
+            g: 112,
+            b: 214,
+        },
+        NamedColor::BrightCyan => Rgb {
+            r: 41,
+            g: 184,
+            b: 219,
+        },
+        NamedColor::BrightWhite => Rgb {
+            r: 255,
+            g: 255,
+            b: 255,
+        },
+        NamedColor::Foreground => Rgb {
+            r: 204,
+            g: 204,
+            b: 204,
+        },
+        NamedColor::Background => Rgb {
+            r: 30,
+            g: 30,
+            b: 30,
+        },
+        NamedColor::Cursor => Rgb {
+            r: 255,
+            g: 255,
+            b: 255,
+        },
+        _ => Rgb {
+            r: 204,
+            g: 204,
+            b: 204,
+        },
     }
 }
 
@@ -584,12 +896,32 @@ fn indexed_color(index: u8) -> Rgb {
         })
     } else if index < 232 {
         let index = index - 16;
-        let r = (index / 36) * 51;
-        let g = ((index / 6) % 6) * 51;
-        let b = (index % 6) * 51;
-        Rgb { r, g, b }
+        Rgb {
+            r: (index / 36) * 51,
+            g: ((index / 6) % 6) * 51,
+            b: (index % 6) * 51,
+        }
     } else {
         let gray = 8 + (index - 232) * 10;
-        Rgb { r: gray, g: gray, b: gray }
+        Rgb {
+            r: gray,
+            g: gray,
+            b: gray,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wide_char_span_is_two_columns() {
+        let cell = Cell {
+            c: '你',
+            flags: Flags::WIDE_CHAR,
+            ..Cell::default()
+        };
+        assert_eq!(cell_column_span(&cell), 2);
     }
 }
