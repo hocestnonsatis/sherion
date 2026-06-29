@@ -1,5 +1,9 @@
 [window]
 title = "Sherion"
+width = 1326.0
+height = 760.0
+always_on_top = false
+decorations = "borderless"
 
 [font]
 family = "DejaVu Sans Mono"
@@ -12,6 +16,8 @@ fallback = [
     "Noto Sans Symbols",
     "Noto Color Emoji",
 ]
+ligatures = false
+glyph_atlas = false
 
 [colors]
 foreground = "#cccccc"
@@ -21,20 +27,73 @@ cursor = "#ffffff"
 [terminal]
 scrollback_lines = 10000
 shell = ""
+shell_args = []
+sanitize_paste = true
+cursor_style = "block"
+kitty_keyboard = true
+osc52 = "copypaste"
+busy_heuristic_ms = 800
 
 [bell]
 visual = true
+audible = true
+urgency = false
 
 [appearance]
 theme = "auto"
 opacity = 1.0
+background_mode = "cover"
+background_opacity = 0.3499999940395355
+background_shader = "none"
+background_shader_intensity = 0.5
 
 [ui]
 font_zoom = 1.0
 sidebar_width = 157.1796875
 sidebar_collapsed = false
 view_mode = "single"
+follow_output = true
 
 [session]
 restore_tabs = false
 cwd = ["/home/anilo/Projeler/sherion"]
+
+[keybindings]
+new_tab = "ctrl+shift+t"
+duplicate_tab = "ctrl+shift+u"
+close_tab = "ctrl+shift+w"
+detach_tab = "ctrl+shift+n"
+next_tab = "ctrl+tab"
+prev_tab = "ctrl+shift+tab"
+rename_tab = "f2"
+copy = "ctrl+shift+c"
+copy_insert = "ctrl+shift+insert"
+paste = "ctrl+shift+v"
+paste_insert = "shift+insert"
+clear_scrollback = "ctrl+shift+k"
+zoom_in = "ctrl+="
+zoom_out = "ctrl+-"
+zoom_reset = "ctrl+0"
+open_search = "ctrl+shift+f"
+open_palette = "ctrl+shift+p"
+select_tab_1 = "ctrl+1"
+select_tab_2 = "ctrl+2"
+select_tab_3 = "ctrl+3"
+select_tab_4 = "ctrl+4"
+select_tab_5 = "ctrl+5"
+select_tab_6 = "ctrl+6"
+select_tab_7 = "ctrl+7"
+select_tab_8 = "ctrl+8"
+select_tab_9 = "ctrl+9"
+split_vertical = "ctrl+shift+d"
+split_horizontal = "ctrl+shift+e"
+close_pane = "ctrl+shift+q"
+focus_pane_left = "ctrl+shift+left"
+focus_pane_right = "ctrl+shift+right"
+focus_pane_up = "ctrl+shift+up"
+focus_pane_down = "ctrl+shift+down"
+scroll_page_up = "shift+pageup"
+scroll_page_down = "shift+pagedown"
+jump_prompt_prev = "alt+shift+up"
+jump_prompt_next = "alt+shift+down"
+toggle_fullscreen = "f11"

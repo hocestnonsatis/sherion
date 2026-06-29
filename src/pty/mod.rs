@@ -1,4 +1,6 @@
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 use std::thread::JoinHandle;
 
 use alacritty_terminal::event::WindowSize;
@@ -9,17 +11,32 @@ use alacritty_terminal::term::Term;
 use alacritty_terminal::tty::{self, Options as PtyOptions, Shell};
 use anyhow::{Context, Result};
 use parking_lot::Mutex;
+use vte::ansi::ModifyOtherKeys;
 
 use crate::config::Config;
 use crate::event::EventProxy;
 use crate::render::TerminalLayout;
+use crate::terminal_setup;
+
+#[cfg(windows)]
+mod windows;
+
+mod busy;
+mod output_tap;
+mod tap;
+use tap::TappingPty;
 
 pub struct PtySession {
     pub terminal: Arc<FairMutex<Term<EventProxy>>>,
     pub notifier: Notifier,
     io_thread: Mutex<Option<JoinHandle<()>>>,
+    reported_cwd: Arc<Mutex<Option<PathBuf>>>,
+    modify_other_keys: Arc<Mutex<ModifyOtherKeys>>,
     #[cfg(unix)]
     process: Option<ProcessHandle>,
+    /// Updated on PTY output; used for non-Unix busy heuristics.
+    #[cfg_attr(unix, allow(dead_code))]
+    last_output_at: Arc<Mutex<Option<Instant>>>,
 }
 
 /// Captured handles used to tell whether a foreground command is running in the
@@ -47,8 +64,9 @@ impl PtySession {
         working_directory: Option<std::path::PathBuf>,
     ) -> Result<Self> {
         let term_config = config.term_config();
-        let terminal = Term::new(term_config, &layout, event_proxy.clone());
-        let terminal = Arc::new(FairMutex::new(terminal));
+        let mut term = Term::new(term_config, &layout, event_proxy.clone());
+        terminal_setup::apply_config_to_term(config, &mut term);
+        let terminal = Arc::new(FairMutex::new(term));
 
         let mut pty_options = PtyOptions::default();
         pty_options
@@ -60,11 +78,30 @@ impl PtySession {
         pty_options.working_directory = working_directory;
 
         if !config.terminal.shell.is_empty() {
-            pty_options.shell = Some(Shell::new(config.terminal.shell.clone(), Vec::new()));
+            pty_options.shell = Some(Shell::new(
+                config.terminal.shell.clone(),
+                config.terminal.shell_args.clone(),
+            ));
         }
 
         let window_size = layout.window_size();
-        let pty = tty::new(&pty_options, window_size, 0).context("failed to create PTY")?;
+        let reported_cwd = Arc::new(Mutex::new(None));
+        let modify_other_keys = Arc::new(Mutex::new(ModifyOtherKeys::Reset));
+        let last_output_at = Arc::new(Mutex::new(None));
+        let pty_notifier = Arc::new(Mutex::new(None::<Notifier>));
+
+        let inner = tty::new(&pty_options, window_size, 0).context("failed to create PTY")?;
+        #[cfg(windows)]
+        windows::on_pty_created();
+
+        let pty = TappingPty::new(
+            inner,
+            Arc::clone(&reported_cwd),
+            Arc::clone(&modify_other_keys),
+            Arc::clone(&pty_notifier),
+            Arc::clone(&last_output_at),
+        )
+        .context("failed to wrap PTY")?;
 
         // Capture the shell pid and a private dup of the master fd before the PTY
         // is moved into the IO event loop, so we can poll the foreground process
@@ -95,6 +132,7 @@ impl PtySession {
         .context("failed to create PTY event loop")?;
 
         let notifier = Notifier(event_loop.channel());
+        *pty_notifier.lock() = Some(Notifier(event_loop.channel()));
         let io_thread = event_loop.spawn();
 
         let handle = std::thread::spawn(move || {
@@ -105,13 +143,23 @@ impl PtySession {
             terminal,
             notifier,
             io_thread: Mutex::new(Some(handle)),
+            reported_cwd,
+            modify_other_keys,
             #[cfg(unix)]
             process,
+            last_output_at,
         })
+    }
+
+    pub fn modify_other_keys(&self) -> ModifyOtherKeys {
+        *self.modify_other_keys.lock()
     }
 
     /// Best-effort current directory for the shell process backing this tab.
     pub fn current_working_directory(&self) -> Option<std::path::PathBuf> {
+        if let Some(cwd) = self.reported_cwd.lock().clone() {
+            return Some(cwd);
+        }
         #[cfg(unix)]
         {
             let process = self.process.as_ref()?;
@@ -125,17 +173,31 @@ impl PtySession {
         }
     }
 
+    pub fn reported_cwd_handle(&self) -> Arc<Mutex<Option<PathBuf>>> {
+        Arc::clone(&self.reported_cwd)
+    }
+
     /// Whether a foreground command (i.e. not the idle shell prompt) is running.
-    pub fn is_busy(&self) -> bool {
+    ///
+    /// On Unix this compares the PTY foreground process group against the shell.
+    /// On other platforms this uses a best-effort recent-output activity heuristic.
+    pub fn is_busy(&self, heuristic_ms: u64) -> bool {
         #[cfg(unix)]
         {
+            let _ = heuristic_ms;
             use std::os::fd::AsRawFd;
             if let Some(process) = self.process.as_ref() {
                 let fg = unsafe { libc::tcgetpgrp(process.master_fd.as_raw_fd()) };
                 return fg > 0 && fg != process.shell_pid;
             }
+            return false;
         }
-        false
+
+        #[cfg(not(unix))]
+        {
+            let last = *self.last_output_at.lock();
+            busy::recent_output_is_busy(last, Instant::now(), heuristic_ms)
+        }
     }
 }
 

@@ -46,9 +46,14 @@ pub enum MenuAction {
     ViewSingle,
     ViewGrid,
     TogglePerfOverlay,
+    ToggleFullscreen,
+    ToggleFollowOutput,
     ZoomIn,
     ZoomOut,
     ZoomReset,
+    ToggleTabPin,
+    CycleTabColor,
+    ToggleAlwaysOnTop,
     Quit,
 }
 

@@ -12,4 +12,6 @@ pub struct TabBarEntry {
     pub busy: bool,
     /// How long the current command has been running (when `busy`).
     pub elapsed: Option<Duration>,
+    pub pinned: bool,
+    pub accent: Option<[u8; 3]>,
 }

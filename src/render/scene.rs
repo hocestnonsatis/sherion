@@ -5,13 +5,14 @@ use alacritty_terminal::term::color::Colors;
 use alacritty_terminal::term::{point_to_viewport, RenderableCursor};
 use alacritty_terminal::vte::ansi::{Color, CursorShape, NamedColor, Rgb};
 use parley::layout::PositionedLayoutItem;
-use parley::{FontFamily, FontFamilyName, FontWeight, LayoutContext, LineHeight, StyleProperty};
-use vello::kurbo::{Affine, Rect};
+use parley::{FontFamily, FontFamilyName, FontFeatures, FontWeight, LayoutContext, LineHeight, StyleProperty};
+use vello::kurbo::{Affine, BezPath, Line, Rect};
 use vello::peniko::color::AlphaColor;
-use vello::peniko::{Brush, Fill};
+use vello::peniko::{Brush, Fill, Mix};
 use vello::Scene;
 
 use crate::config::Config;
+use crate::render::atlas::{draw_atlas_glyph, pop_row_clip, push_row_clip, row_band_clip_rect, GlyphAtlas};
 use crate::render::frame::{FrameDamage, SearchMatch, TerminalFrame};
 use crate::render::glyph_cache::{
     cache_layout_glyphs, emit_cached_glyphs, emit_glyph_run, GlyphCache, GlyphCacheKey,
@@ -23,6 +24,17 @@ pub struct SceneBuilder {
     text_buf: String,
     font_family: Option<FontFamily<'static>>,
     glyph_cache: GlyphCache,
+    glyph_atlas: Option<GlyphAtlas>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum UnderlineKind {
+    None,
+    Single,
+    Double,
+    Curly,
+    Dotted,
+    Dashed,
 }
 
 #[derive(Clone)]
@@ -30,7 +42,25 @@ struct GlyphStyle {
     fg: Brush,
     bold: bool,
     italic: bool,
-    underline: bool,
+    underline: UnderlineKind,
+    strikethrough: bool,
+    blink: bool,
+}
+
+fn underline_kind_from_flags(flags: Flags) -> UnderlineKind {
+    if flags.contains(Flags::UNDERCURL) {
+        UnderlineKind::Curly
+    } else if flags.contains(Flags::DOUBLE_UNDERLINE) {
+        UnderlineKind::Double
+    } else if flags.contains(Flags::DOTTED_UNDERLINE) {
+        UnderlineKind::Dotted
+    } else if flags.contains(Flags::DASHED_UNDERLINE) {
+        UnderlineKind::Dashed
+    } else if flags.contains(Flags::UNDERLINE) {
+        UnderlineKind::Single
+    } else {
+        UnderlineKind::None
+    }
 }
 
 impl GlyphStyle {
@@ -48,11 +78,13 @@ impl GlyphStyle {
     ) -> Self {
         let col = point.column.0;
         let mut fg = cell_foreground(cell, point, colors, default_fg, default_bg, selection);
-        let mut underline = cell.flags.contains(Flags::UNDERLINE);
+        let mut underline = underline_kind_from_flags(cell.flags);
 
         if link_match_contains(link_hovers, row, col) {
             fg = link_foreground_brush();
-            underline = true;
+            if underline == UnderlineKind::None {
+                underline = UnderlineKind::Single;
+            }
         } else if search_active_match_contains(search_matches, search_active, row, col) {
             fg = search_active_foreground_brush();
         } else if search_match_contains(search_matches, row, col) {
@@ -60,12 +92,20 @@ impl GlyphStyle {
         }
 
         Self {
-            fg,
+            fg: {
+                let mut brush = fg;
+                if cell.flags.intersects(Flags::DIM | Flags::DIM_BOLD) {
+                    brush = with_opacity(brush, 0.55);
+                }
+                brush
+            },
             bold: cell
                 .flags
                 .intersects(Flags::BOLD | Flags::BOLD_ITALIC | Flags::DIM_BOLD),
             italic: cell.flags.intersects(Flags::ITALIC | Flags::BOLD_ITALIC),
             underline,
+            strikethrough: cell.flags.contains(Flags::STRIKEOUT),
+            blink: cell.flags.contains(Flags::BLINK),
         }
     }
 }
@@ -77,12 +117,25 @@ impl SceneBuilder {
             text_buf: String::with_capacity(256),
             font_family: None,
             glyph_cache: GlyphCache::new(),
+            glyph_atlas: None,
+        }
+    }
+
+    fn ensure_glyph_atlas(&mut self, config: &Config) {
+        if config.font.glyph_atlas && self.glyph_atlas.is_none() {
+            self.glyph_atlas = GlyphAtlas::new(config);
+        }
+        if !config.font.glyph_atlas {
+            self.glyph_atlas = None;
         }
     }
 
     pub fn invalidate_font_cache(&mut self) {
         self.font_family = None;
         self.glyph_cache.clear();
+        if let Some(atlas) = self.glyph_atlas.as_mut() {
+            atlas.clear();
+        }
     }
 
     pub fn update_terminal(
@@ -94,7 +147,9 @@ impl SceneBuilder {
         font_cx: &mut parley::FontContext,
         terminal_opacity: f32,
         damage: &FrameDamage,
+        ime_preedit: Option<&str>,
     ) {
+        let text_blink_visible = frame.text_blink_visible;
         let default_fg: Brush = config.foreground_brush().into();
         let default_bg: Brush = config.background_brush().into();
         let cursor_brush: Brush = config.cursor_brush().into();
@@ -112,6 +167,8 @@ impl SceneBuilder {
         if damage.is_unchanged() {
             return;
         }
+
+        self.ensure_glyph_atlas(config);
 
         if damage.is_full() {
             scene.reset();
@@ -159,6 +216,7 @@ impl SceneBuilder {
                     search_matches,
                     search_active,
                     link_hovers,
+                    text_blink_visible,
                 );
             }
         } else if let Some(lines) = damage.damaged_lines() {
@@ -166,6 +224,8 @@ impl SceneBuilder {
                 if bounds.line >= row_count {
                     continue;
                 }
+                let clip = row_band_clip_rect(bounds.line, layout, x_off, y_off);
+                push_row_clip(scene, &clip);
                 clear_row_band(scene, bounds.line, layout, x_off, y_off, &bg_opaque);
                 let cells = &frame.rows[bounds.line];
                 if !cells.is_empty() {
@@ -200,40 +260,108 @@ impl SceneBuilder {
                     search_matches,
                     search_active,
                     link_hovers,
+                    text_blink_visible,
                 );
+                pop_row_clip(scene);
             }
         }
 
-        self.render_cursor(
+        if frame.cursor_visible {
+            self.render_cursor(
+                scene,
+                frame.cursor,
+                frame.display_offset,
+                layout,
+                &cursor_brush,
+                frame
+                    .cursor_cell
+                    .as_ref()
+                    .map(cell_column_span)
+                    .unwrap_or(1),
+            );
+
+            if frame.cursor.shape == CursorShape::Block {
+                if let Some(cell) = frame.cursor_cell.as_ref() {
+                    self.render_cursor_glyph(
+                        scene,
+                        font_cx,
+                        frame.cursor,
+                        frame.display_offset,
+                        cell,
+                        layout,
+                        config,
+                        &default_fg,
+                        &default_bg,
+                        colors,
+                        selection,
+                    );
+                }
+            }
+        }
+
+        self.render_scrollbar(scene, frame, layout, x_off, y_off);
+
+        if let Some(preedit) = ime_preedit.filter(|text| !text.is_empty()) {
+            self.render_ime_preedit(
+                scene,
+                font_cx,
+                frame.cursor,
+                frame.display_offset,
+                preedit,
+                layout,
+                config,
+                &default_fg,
+            );
+        }
+    }
+
+    fn render_ime_preedit(
+        &mut self,
+        scene: &mut Scene,
+        font_cx: &mut parley::FontContext,
+        cursor: RenderableCursor,
+        display_offset: usize,
+        preedit: &str,
+        layout: TerminalLayout,
+        config: &Config,
+        default_fg: &Brush,
+    ) {
+        let Some(viewport) = point_to_viewport(display_offset, cursor.point) else {
+            return;
+        };
+        let col = viewport.column.0;
+        let row = viewport.line;
+        if row >= layout.rows as usize || col >= layout.cols as usize {
+            return;
+        }
+
+        let x_off = f64::from(layout.content_offset_x);
+        let y_off = f64::from(layout.content_offset_y);
+        let x = x_off + col as f64 * f64::from(layout.cell_width);
+        let y = y_off + row as f64 * f64::from(layout.cell_height);
+
+        self.text_buf.clear();
+        self.text_buf.push_str(preedit);
+        let text = std::mem::take(&mut self.text_buf);
+        self.draw_glyph_text(
             scene,
-            frame.cursor,
-            frame.display_offset,
+            font_cx,
+            &text,
+            x,
+            y,
             layout,
-            &cursor_brush,
-            frame
-                .cursor_cell
-                .as_ref()
-                .map(cell_column_span)
-                .unwrap_or(1),
+            config,
+            GlyphStyle {
+                fg: default_fg.clone(),
+                bold: false,
+                italic: false,
+                underline: UnderlineKind::Single,
+                strikethrough: false,
+                blink: false,
+            },
+            false,
         );
-
-        if frame.cursor.shape == CursorShape::Block {
-            if let Some(cell) = frame.cursor_cell.as_ref() {
-                self.render_cursor_glyph(
-                    scene,
-                    font_cx,
-                    frame.cursor,
-                    frame.display_offset,
-                    cell,
-                    layout,
-                    config,
-                    &default_fg,
-                    &default_bg,
-                    colors,
-                    selection,
-                );
-            }
-        }
+        self.text_buf = text;
     }
 
     fn render_row(
@@ -251,6 +379,7 @@ impl SceneBuilder {
         search_matches: &[SearchMatch],
         search_active: Option<usize>,
         link_hovers: &[SearchMatch],
+        text_blink_visible: bool,
     ) {
         let x_off = f64::from(layout.content_offset_x);
         let y_off = f64::from(layout.content_offset_y);
@@ -263,6 +392,30 @@ impl SceneBuilder {
         // natural width instead of the fixed `cell_width`, which accumulates a
         // horizontal drift across the row. Per-cell placement keeps the
         // monospace grid exact.
+        if config.font.ligatures {
+            self.render_row_ligature_runs(
+                scene,
+                font_cx,
+                row,
+                cells,
+                layout,
+                config,
+                default_fg,
+                default_bg,
+                colors,
+                selection,
+                search_matches,
+                search_active,
+                link_hovers,
+                x_off,
+                y,
+                cell_w,
+                max_cols,
+                text_blink_visible,
+            );
+            return;
+        }
+
         for (point, cell) in cells {
             let col = point.column.0;
             if col >= max_cols {
@@ -286,12 +439,177 @@ impl SceneBuilder {
                 row,
             );
 
+            if !should_draw_blink_glyph(&style, text_blink_visible) {
+                continue;
+            }
+
             self.text_buf.clear();
             push_cell_text(&mut self.text_buf, cell);
             let text = std::mem::take(&mut self.text_buf);
 
             let x = x_off + col as f64 * cell_w;
-            self.draw_glyph_text(scene, font_cx, &text, x, y, layout, config, style);
+            self.draw_glyph_text(scene, font_cx, &text, x, y, layout, config, style.clone(), false);
+
+            if style.strikethrough {
+                let cell_h = f64::from(layout.cell_height);
+                let strike_y = y + cell_h * 0.55;
+                scene.stroke(
+                    &vello::kurbo::Stroke::new(1.0),
+                    Affine::IDENTITY,
+                    &style.fg,
+                    None,
+                    &Line::new((x, strike_y), (x + cell_w, strike_y)),
+                );
+            }
+
+            if style.underline != UnderlineKind::None {
+                render_cell_underline(
+                    scene,
+                    x,
+                    y,
+                    cell_w,
+                    f64::from(layout.cell_height),
+                    &style.fg,
+                    style.underline,
+                );
+            }
+
+            self.text_buf = text;
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_row_ligature_runs(
+        &mut self,
+        scene: &mut Scene,
+        font_cx: &mut parley::FontContext,
+        row: usize,
+        cells: &[(Point, Cell)],
+        layout: TerminalLayout,
+        config: &Config,
+        default_fg: &Brush,
+        default_bg: &Brush,
+        colors: &Colors,
+        selection: Option<SelectionRange>,
+        search_matches: &[SearchMatch],
+        search_active: Option<usize>,
+        link_hovers: &[SearchMatch],
+        x_off: f64,
+        y: f64,
+        cell_w: f64,
+        max_cols: usize,
+        text_blink_visible: bool,
+    ) {
+        let cell_h = f64::from(layout.cell_height);
+        let mut index = 0;
+        while index < cells.len() {
+            let (point, cell) = &cells[index];
+            let col = point.column.0;
+            if col >= max_cols || (cell.c == ' ' && cell.zerowidth().is_none()) {
+                index += 1;
+                continue;
+            }
+
+            let style = GlyphStyle::from_cell(
+                cell,
+                *point,
+                colors,
+                default_fg,
+                default_bg,
+                selection,
+                search_matches,
+                search_active,
+                link_hovers,
+                row,
+            );
+
+            self.text_buf.clear();
+            push_cell_text(&mut self.text_buf, cell);
+            let start_col = col;
+            let mut run_cols = cell_column_span(cell);
+            index += 1;
+
+            while index < cells.len() {
+                let (next_point, next_cell) = &cells[index];
+                let next_col = next_point.column.0;
+                if next_col >= max_cols {
+                    break;
+                }
+                if next_cell.c == ' ' && next_cell.zerowidth().is_none() {
+                    break;
+                }
+                let next_style = GlyphStyle::from_cell(
+                    next_cell,
+                    *next_point,
+                    colors,
+                    default_fg,
+                    default_bg,
+                    selection,
+                    search_matches,
+                    search_active,
+                    link_hovers,
+                    row,
+                );
+                if !glyph_styles_match(&style, &next_style) {
+                    break;
+                }
+                if next_col != start_col + run_cols {
+                    break;
+                }
+                push_cell_text(&mut self.text_buf, next_cell);
+                run_cols += cell_column_span(next_cell);
+                index += 1;
+            }
+
+            let text = std::mem::take(&mut self.text_buf);
+            let x = x_off + start_col as f64 * cell_w;
+            let run_width = run_cols as f64 * cell_w;
+            if should_draw_blink_glyph(&style, text_blink_visible) {
+                scene.push_layer(
+                    Fill::NonZero,
+                    Mix::Normal,
+                    1.0,
+                    Affine::IDENTITY,
+                    &Rect::new(x, y, x + run_width, y + cell_h),
+                );
+                self.draw_glyph_text(
+                    scene,
+                    font_cx,
+                    &text,
+                    x,
+                    y,
+                    layout,
+                    config,
+                    style.clone(),
+                    true,
+                );
+                scene.pop_layer();
+
+                for col_offset in 0..run_cols {
+                    let cx = x + col_offset as f64 * cell_w;
+                    if style.strikethrough {
+                        let strike_y = y + cell_h * 0.55;
+                        scene.stroke(
+                            &vello::kurbo::Stroke::new(1.0),
+                            Affine::IDENTITY,
+                            &style.fg,
+                            None,
+                            &Line::new((cx, strike_y), (cx + cell_w, strike_y)),
+                        );
+                    }
+                    if style.underline != UnderlineKind::None {
+                        render_cell_underline(
+                            scene,
+                            cx,
+                            y,
+                            cell_w,
+                            cell_h,
+                            &style.fg,
+                            style.underline,
+                        );
+                    }
+                }
+            }
 
             self.text_buf = text;
         }
@@ -307,16 +625,33 @@ impl SceneBuilder {
         layout: TerminalLayout,
         config: &Config,
         style: GlyphStyle,
+        ligatures: bool,
     ) {
         if text.is_empty() {
             return;
+        }
+
+        if config.font.glyph_atlas && !ligatures && atlas_text_candidate(text) {
+            if let Some(atlas) = self.glyph_atlas.as_mut() {
+                if let Some(entry) = atlas.get_or_rasterize_text(
+                    text,
+                    layout.font_size,
+                    style.bold,
+                    style.italic,
+                    &style.fg,
+                    config,
+                ) {
+                    draw_atlas_glyph(scene, entry, x, y, layout.cell_height);
+                    return;
+                }
+            }
         }
 
         let cache_key = GlyphCacheKey::new(
             text,
             style.bold,
             style.italic,
-            style.underline,
+            style.underline == UnderlineKind::Single,
             layout.font_size,
         );
 
@@ -346,8 +681,16 @@ impl SceneBuilder {
                 range.clone(),
             );
         }
-        if style.underline {
-            builder.push(StyleProperty::Underline(true), range);
+        if style.underline == UnderlineKind::Single {
+            builder.push(StyleProperty::Underline(true), range.clone());
+        }
+        if ligatures {
+            builder.push(
+                StyleProperty::FontFeatures(FontFeatures::Source(std::borrow::Cow::Borrowed(
+                    "liga,calt",
+                ))),
+                range.clone(),
+            );
         }
 
         let mut text_layout = builder.build(text);
@@ -430,8 +773,11 @@ impl SceneBuilder {
                     .flags
                     .intersects(Flags::BOLD | Flags::BOLD_ITALIC | Flags::DIM_BOLD),
                 italic: cell.flags.intersects(Flags::ITALIC | Flags::BOLD_ITALIC),
-                underline: cell.flags.contains(Flags::UNDERLINE),
+                underline: underline_kind_from_flags(cell.flags),
+                strikethrough: cell.flags.contains(Flags::STRIKEOUT),
+                blink: cell.flags.contains(Flags::BLINK),
             },
+            false,
         );
 
         self.text_buf = text;
@@ -505,6 +851,127 @@ impl SceneBuilder {
                 );
             }
             CursorShape::Hidden => {}
+        }
+    }
+
+    fn render_scrollbar(
+        &self,
+        scene: &mut Scene,
+        frame: &TerminalFrame,
+        layout: TerminalLayout,
+        x_off: f64,
+        y_off: f64,
+    ) {
+        if frame.scroll_history == 0 {
+            return;
+        }
+        let width = f64::from(layout.cell_width) * f64::from(layout.cols);
+        let height = f64::from(layout.cell_height) * f64::from(layout.rows);
+        let track_w = 4.0;
+        let track_x = x_off + width - track_w - 1.0;
+        let track_bg = Brush::Solid(AlphaColor::from_rgba8(255, 255, 255, 40));
+        scene.fill(
+            Fill::NonZero,
+            Affine::IDENTITY,
+            &track_bg,
+            None,
+            &Rect::new(track_x, y_off, track_x + track_w, y_off + height),
+        );
+        let visible = layout.rows as f64;
+        let total = visible + frame.scroll_history as f64;
+        let thumb_h = (height * (visible / total)).max(12.0);
+        let max_offset = frame.scroll_history as f64;
+        let frac = frame.display_offset as f64 / max_offset.max(1.0);
+        let thumb_y = y_off + (height - thumb_h) * frac;
+        let thumb = Brush::Solid(AlphaColor::from_rgba8(180, 180, 180, 180));
+        scene.fill(
+            Fill::NonZero,
+            Affine::IDENTITY,
+            &thumb,
+            None,
+            &Rect::new(track_x, thumb_y, track_x + track_w, thumb_y + thumb_h),
+        );
+    }
+}
+
+fn render_cell_underline(
+    scene: &mut Scene,
+    x: f64,
+    y: f64,
+    cell_w: f64,
+    cell_h: f64,
+    brush: &Brush,
+    kind: UnderlineKind,
+) {
+    let base_y = y + cell_h * 0.88;
+    match kind {
+        UnderlineKind::None => {}
+        UnderlineKind::Single => {
+            scene.stroke(
+                &vello::kurbo::Stroke::new(1.0),
+                Affine::IDENTITY,
+                brush,
+                None,
+                &Line::new((x, base_y), (x + cell_w, base_y)),
+            );
+        }
+        UnderlineKind::Double => {
+            scene.stroke(
+                &vello::kurbo::Stroke::new(1.0),
+                Affine::IDENTITY,
+                brush,
+                None,
+                &Line::new((x, base_y), (x + cell_w, base_y)),
+            );
+            scene.stroke(
+                &vello::kurbo::Stroke::new(1.0),
+                Affine::IDENTITY,
+                brush,
+                None,
+                &Line::new((x, base_y - 3.0), (x + cell_w, base_y - 3.0)),
+            );
+        }
+        UnderlineKind::Dashed => {
+            let stroke = vello::kurbo::Stroke::new(1.0).with_dashes(0.0, &[4.0, 3.0]);
+            scene.stroke(
+                &stroke,
+                Affine::IDENTITY,
+                brush,
+                None,
+                &Line::new((x, base_y), (x + cell_w, base_y)),
+            );
+        }
+        UnderlineKind::Dotted => {
+            let stroke = vello::kurbo::Stroke::new(1.0).with_dashes(0.0, &[1.0, 2.5]);
+            scene.stroke(
+                &stroke,
+                Affine::IDENTITY,
+                brush,
+                None,
+                &Line::new((x, base_y), (x + cell_w, base_y)),
+            );
+        }
+        UnderlineKind::Curly => {
+            let amplitude = 2.0;
+            let wavelength = 6.0;
+            let steps = (cell_w / 2.0).ceil().max(1.0) as i32;
+            let mut path = BezPath::new();
+            for step in 0..=steps {
+                let px = x + (step as f64 / steps as f64) * cell_w;
+                let py = base_y + amplitude * ((px - x) / wavelength * std::f64::consts::TAU).sin();
+                if step == 0 {
+                    path.move_to((px, py));
+                } else {
+                    path.line_to((px, py));
+                }
+            }
+            scene.stroke(
+                &vello::kurbo::Stroke::new(1.0),
+                Affine::IDENTITY,
+                brush,
+                None,
+                &path,
+            );
         }
     }
 }
@@ -666,11 +1133,49 @@ fn cell_column_span(cell: &Cell) -> usize {
     }
 }
 
+fn glyph_styles_match(a: &GlyphStyle, b: &GlyphStyle) -> bool {
+    brush_solid_eq(&a.fg, &b.fg)
+        && a.bold == b.bold
+        && a.italic == b.italic
+        && a.underline == b.underline
+        && a.strikethrough == b.strikethrough
+        && a.blink == b.blink
+}
+
+fn should_draw_blink_glyph(style: &GlyphStyle, text_blink_visible: bool) -> bool {
+    !style.blink || text_blink_visible
+}
+
 fn push_cell_text(buf: &mut String, cell: &Cell) {
     buf.push(cell.c);
     if let Some(zerowidth) = cell.zerowidth() {
         buf.extend(zerowidth);
     }
+}
+
+fn atlas_text_candidate(text: &str) -> bool {
+    if text.is_empty() || text.chars().count() > 8 {
+        return false;
+    }
+    let mut chars = text.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if first.is_ascii() {
+        return chars.all(|ch| ch.is_ascii() || is_combining_mark(ch));
+    }
+    text.chars().count() == 1
+}
+
+fn is_combining_mark(ch: char) -> bool {
+    matches!(
+        ch as u32,
+        0x0300..=0x036F
+            | 0x1AB0..=0x1AFF
+            | 0x1DC0..=0x1DFF
+            | 0x20D0..=0x20FF
+            | 0xFE20..=0xFE2F
+    )
 }
 
 fn apply_cell_colors(
@@ -914,6 +1419,7 @@ fn indexed_color(index: u8) -> Rgb {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alacritty_terminal::index::{Column, Line};
 
     #[test]
     fn wide_char_span_is_two_columns() {
@@ -923,5 +1429,123 @@ mod tests {
             ..Cell::default()
         };
         assert_eq!(cell_column_span(&cell), 2);
+    }
+
+    #[test]
+    fn blink_style_is_detected_from_cell_flag() {
+        let cell = Cell {
+            c: 'X',
+            flags: Flags::BLINK,
+            ..Cell::default()
+        };
+        let style = GlyphStyle::from_cell(
+            &cell,
+            Point::new(Line(0), Column(0)),
+            &Colors::default(),
+            &Brush::Solid(AlphaColor::from_rgba8(200, 200, 200, 255)),
+            &Brush::Solid(AlphaColor::from_rgba8(20, 20, 20, 255)),
+            None,
+            &[],
+            None,
+            &[],
+            0,
+        );
+        assert!(style.blink);
+    }
+
+    #[test]
+    fn combining_marks_are_pushed_into_cell_text() {
+        let mut cell = Cell {
+            c: 'e',
+            ..Cell::default()
+        };
+        cell.push_zerowidth('\u{0301}');
+        let mut buf = String::new();
+        push_cell_text(&mut buf, &cell);
+        assert_eq!(buf, "e\u{0301}");
+        assert!(atlas_text_candidate(&buf));
+    }
+
+    #[test]
+    fn combining_marks_do_not_split_ligature_runs_by_style() {
+        let base = GlyphStyle {
+            fg: Brush::Solid(AlphaColor::from_rgba8(200, 200, 200, 255)),
+            bold: false,
+            italic: false,
+            underline: UnderlineKind::None,
+            strikethrough: false,
+            blink: false,
+        };
+        let with_blink = GlyphStyle {
+            blink: true,
+            ..base.clone()
+        };
+        assert!(!glyph_styles_match(&base, &with_blink));
+    }
+
+    #[test]
+    fn multiple_combining_marks_are_appended_in_order() {
+        let mut cell = Cell {
+            c: 'a',
+            ..Cell::default()
+        };
+        cell.push_zerowidth('\u{0301}'); // acute
+        cell.push_zerowidth('\u{0308}'); // diaeresis
+        let mut buf = String::new();
+        push_cell_text(&mut buf, &cell);
+        assert_eq!(buf, "a\u{0301}\u{0308}");
+        assert!(atlas_text_candidate(&buf));
+    }
+
+    #[test]
+    fn combining_marks_from_extended_blocks_are_recognized() {
+        assert!(is_combining_mark('\u{20D0}')); // combining left harpoon above
+        assert!(is_combining_mark('\u{1AB0}')); // combining doubly circumflex accent
+        assert!(!is_combining_mark('e'));
+    }
+
+    #[test]
+    fn wide_char_with_combining_mark_builds_single_text_run() {
+        let mut cell = Cell {
+            c: '你',
+            flags: Flags::WIDE_CHAR,
+            ..Cell::default()
+        };
+        cell.push_zerowidth('\u{0301}');
+        let mut buf = String::new();
+        push_cell_text(&mut buf, &cell);
+        assert_eq!(buf, "你\u{0301}");
+        // Non-ASCII base with combining marks exceeds single-scalar atlas path.
+        assert!(!atlas_text_candidate(&buf));
+    }
+
+    #[test]
+    fn wide_char_span_unchanged_with_zerowidth_marks() {
+        let mut cell = Cell {
+            c: '你',
+            flags: Flags::WIDE_CHAR,
+            ..Cell::default()
+        };
+        cell.push_zerowidth('\u{0301}');
+        assert_eq!(cell_column_span(&cell), 2);
+    }
+
+    #[test]
+    fn atlas_text_candidate_rejects_long_runs() {
+        assert!(!atlas_text_candidate("abcdefghi")); // 9 chars
+        assert!(atlas_text_candidate("abcdefgh")); // 8 chars
+    }
+
+    #[test]
+    fn atlas_text_candidate_accepts_ascii_with_combining_marks() {
+        assert!(atlas_text_candidate("e\u{0301}\u{0308}"));
+        // Precomposed single scalar uses the non-ASCII single-char atlas path.
+        assert!(atlas_text_candidate("é"));
+    }
+
+    #[test]
+    fn atlas_text_candidate_accepts_single_non_ascii_scalar() {
+        assert!(atlas_text_candidate("你"));
+        assert!(!atlas_text_candidate("你你"));
     }
 }

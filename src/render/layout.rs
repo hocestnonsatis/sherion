@@ -34,6 +34,7 @@ impl ContentRect {
 }
 
 pub const GRID_GUTTER: f32 = 1.0;
+pub const SPLIT_DIVIDER: f32 = 4.0;
 
 /// Maximum number of tabs shown simultaneously in grid view.
 pub const MAX_GRID_PANES: usize = 9;
@@ -191,4 +192,171 @@ pub fn pane_rects(
     }
 
     rects
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct SplitLayoutEntry {
+    pub leaf_id: usize,
+    pub rect: ContentRect,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct SplitDividerHit {
+    pub index: usize,
+    pub rect: ContentRect,
+    pub direction: crate::split::SplitDirection,
+    /// Inner dimension along the split axis (for ratio drag deltas).
+    pub axis_span: f32,
+}
+
+/// Assign leaf rectangles for a split tree inside `rect`.
+pub fn split_tree_rects(
+    rect: ContentRect,
+    node: &crate::split::SplitNode,
+    leaf_id: &mut usize,
+) -> Vec<SplitLayoutEntry> {
+    use crate::split::{SplitDirection, SplitNode};
+
+    match node {
+        SplitNode::Pending => Vec::new(),
+        SplitNode::Leaf { .. } => {
+            let id = *leaf_id;
+            *leaf_id += 1;
+            vec![SplitLayoutEntry { leaf_id: id, rect }]
+        }
+        SplitNode::Split {
+            direction,
+            ratio,
+            first,
+            second,
+        } => {
+            let gutter = SPLIT_DIVIDER;
+            match direction {
+                SplitDirection::Horizontal => {
+                    let inner_w = rect.width() - gutter;
+                    let first_w = inner_w * ratio.clamp(0.1, 0.9);
+                    let first_rect = ContentRect {
+                        x0: rect.x0,
+                        y0: rect.y0,
+                        x1: rect.x0 + first_w,
+                        y1: rect.y1,
+                    };
+                    let second_rect = ContentRect {
+                        x0: rect.x0 + first_w + gutter,
+                        y0: rect.y0,
+                        x1: rect.x1,
+                        y1: rect.y1,
+                    };
+                    let mut out = split_tree_rects(first_rect, first, leaf_id);
+                    out.extend(split_tree_rects(second_rect, second, leaf_id));
+                    out
+                }
+                SplitDirection::Vertical => {
+                    let inner_h = rect.height() - gutter;
+                    let first_h = inner_h * ratio.clamp(0.1, 0.9);
+                    let first_rect = ContentRect {
+                        x0: rect.x0,
+                        y0: rect.y0,
+                        x1: rect.x1,
+                        y1: rect.y0 + first_h,
+                    };
+                    let second_rect = ContentRect {
+                        x0: rect.x0,
+                        y0: rect.y0 + first_h + gutter,
+                        x1: rect.x1,
+                        y1: rect.y1,
+                    };
+                    let mut out = split_tree_rects(first_rect, first, leaf_id);
+                    out.extend(split_tree_rects(second_rect, second, leaf_id));
+                    out
+                }
+            }
+        }
+    }
+}
+
+pub fn split_dividers(
+    rect: ContentRect,
+    node: &crate::split::SplitNode,
+    divider_index: &mut usize,
+) -> Vec<SplitDividerHit> {
+    use crate::split::{SplitDirection, SplitNode};
+
+    match node {
+        SplitNode::Leaf { .. } | SplitNode::Pending => Vec::new(),
+        SplitNode::Split {
+            direction,
+            ratio,
+            first,
+            second,
+        } => {
+            let gutter = SPLIT_DIVIDER;
+            let mut out = Vec::new();
+            let idx = *divider_index;
+            *divider_index += 1;
+            match direction {
+                SplitDirection::Horizontal => {
+                    let inner_w = rect.width() - gutter;
+                    let first_w = inner_w * ratio.clamp(0.1, 0.9);
+                    let divider_rect = ContentRect {
+                        x0: rect.x0 + first_w,
+                        y0: rect.y0,
+                        x1: rect.x0 + first_w + gutter,
+                        y1: rect.y1,
+                    };
+                    out.push(SplitDividerHit {
+                        index: idx,
+                        rect: divider_rect,
+                        direction: SplitDirection::Horizontal,
+                        axis_span: inner_w,
+                    });
+                    let first_rect = ContentRect {
+                        x0: rect.x0,
+                        y0: rect.y0,
+                        x1: rect.x0 + first_w,
+                        y1: rect.y1,
+                    };
+                    let second_rect = ContentRect {
+                        x0: rect.x0 + first_w + gutter,
+                        y0: rect.y0,
+                        x1: rect.x1,
+                        y1: rect.y1,
+                    };
+                    out.extend(split_dividers(first_rect, first, divider_index));
+                    out.extend(split_dividers(second_rect, second, divider_index));
+                }
+                SplitDirection::Vertical => {
+                    let inner_h = rect.height() - gutter;
+                    let first_h = inner_h * ratio.clamp(0.1, 0.9);
+                    let divider_rect = ContentRect {
+                        x0: rect.x0,
+                        y0: rect.y0 + first_h,
+                        x1: rect.x1,
+                        y1: rect.y0 + first_h + gutter,
+                    };
+                    out.push(SplitDividerHit {
+                        index: idx,
+                        rect: divider_rect,
+                        direction: SplitDirection::Vertical,
+                        axis_span: inner_h,
+                    });
+                    let first_rect = ContentRect {
+                        x0: rect.x0,
+                        y0: rect.y0,
+                        x1: rect.x1,
+                        y1: rect.y0 + first_h,
+                    };
+                    let second_rect = ContentRect {
+                        x0: rect.x0,
+                        y0: rect.y0 + first_h + gutter,
+                        x1: rect.x1,
+                        y1: rect.y1,
+                    };
+                    out.extend(split_dividers(first_rect, first, divider_index));
+                    out.extend(split_dividers(second_rect, second, divider_index));
+                }
+            }
+            out
+        }
+    }
 }

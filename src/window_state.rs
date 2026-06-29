@@ -2,32 +2,37 @@ use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use alacritty_terminal::event::{Event as TerminalEvent, Notify, OnResize};
+use alacritty_terminal::event::{Event as TerminalEvent, EventListener, Notify, OnResize};
 use alacritty_terminal::grid::{Dimensions, Scroll};
-use alacritty_terminal::index::{Column, Point, Side};
+use alacritty_terminal::index::{Column, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::cell::Cell;
-use alacritty_terminal::term::viewport_to_point;
+use alacritty_terminal::term::{point_to_viewport, viewport_to_point, ClipboardType, Term, TermMode};
 use winit::dpi::PhysicalSize;
 use winit::event::{ElementState, KeyEvent, MouseButton};
 use winit::event_loop::ActiveEventLoop;
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{CursorIcon, ResizeDirection, Window, WindowId};
 
-use crate::clipboard::{copy_text, paste_text};
+use crate::clipboard::{copy_primary, copy_text, paste_primary, paste_text, sanitize_paste};
 use crate::config::{Config, ThemeMode, ViewModeConfig};
 use crate::input::KeyAction;
+use crate::keybindings::KeybindingsConfig;
+use crate::links;
+use crate::mouse;
 use crate::pty::PtySession;
 use crate::render::frame::{
-    capture_terminal_frame, FrameDamage, SearchMatch, TerminalFrame, TerminalRowBuffer,
+    capture_terminal_frame, frame_has_blink_cells, merge_blink_damage, FrameDamage, SearchMatch,
+    TerminalFrame, TerminalRowBuffer,
 };
 use crate::render::{
     border_size, collapsed_sidebar_width, cursor_for_direction, pane_rects, resize_direction_at,
-    sidebar_width_bounds, ChromeFrame, ChromeMetrics, CommandPaletteFrame, MenuAction, MenuEntry,
-    PaneRender, PerfStatsSnapshot, RenameOverlayFrame, Renderer, SearchOverlayFrame,
-    SearchOverlayHit, TabBarEntry, TabStripHit, TabStripLayout, TerminalLayout, TitleBarHit,
-    MAX_GRID_PANES,
+    sidebar_width_bounds, split_dividers, ChromeFrame, ChromeMetrics, CommandPaletteFrame,
+    ContentRect, MenuAction, MenuEntry, PaneRender, PerfStatsSnapshot, RenameOverlayFrame,
+    Renderer, SearchOverlayFrame, SearchOverlayHit, SplitDividerHit, TabBarEntry, TabStripHit,
+    TabStripLayout, TerminalLayout, TitleBarHit, MAX_GRID_PANES,
 };
+use crate::split::{spawn_leaf_session, SplitDirection};
 use crate::tabs::{EventLoopProxyFactory, Tab, TabId, TabManager};
 
 // Open wide enough that typical startup output (e.g. fastfetch's logo + color
@@ -42,6 +47,7 @@ pub const STARTUP_SETTLE: Duration = Duration::from_millis(120);
 pub const BELL_FLASH_DURATION: Duration = Duration::from_millis(150);
 pub const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(300);
 pub const DOUBLE_CLICK_SLOP: f64 = 5.0;
+const CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(530);
 pub const FONT_ZOOM_MIN: f32 = 0.5;
 pub const FONT_ZOOM_MAX: f32 = 3.0;
 pub const FONT_ZOOM_STEP: f32 = 0.1;
@@ -79,7 +85,15 @@ impl From<ViewMode> for ViewModeConfig {
 #[derive(Clone, Copy, Debug)]
 pub struct PaneSlot {
     pub tab_index: usize,
+    pub leaf_id: usize,
     pub layout: TerminalLayout,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct GlobalSearchMatch {
+    grid_line: i32,
+    start_col: usize,
+    end_col: usize,
 }
 
 #[derive(Default)]
@@ -88,6 +102,11 @@ struct SearchState {
     query: String,
     match_count: usize,
     current_match: usize,
+    global_matches: Vec<GlobalSearchMatch>,
+    case_sensitive: bool,
+    use_regex: bool,
+    whole_word: bool,
+    regex_error: bool,
 }
 
 #[derive(Default)]
@@ -100,6 +119,14 @@ struct RenameState {
 struct CommandPaletteState {
     active: bool,
     query: String,
+    selected_index: usize,
+}
+
+struct SplitDragState {
+    divider_index: usize,
+    direction: SplitDirection,
+    axis_span: f32,
+    last_pos: (f64, f64),
 }
 
 pub struct WindowState {
@@ -111,8 +138,10 @@ pub struct WindowState {
     pub layout: TerminalLayout,
     pub view_mode: ViewMode,
     pub panes: Vec<PaneSlot>,
+    pub focused_pane: usize,
+    split_drag: Option<SplitDragState>,
     pub modifiers: ModifiersState,
-    pub pending_pty_layouts: Vec<(usize, TerminalLayout)>,
+    pub pending_pty_layouts: Vec<(usize, usize, TerminalLayout)>,
     pub pty_resize_deadline: Option<Instant>,
     pub needs_redraw: bool,
     pub selecting: bool,
@@ -127,6 +156,7 @@ pub struct WindowState {
     pub sidebar_collapsed: bool,
     pub font_zoom: f32,
     pub terminal_opacity: f32,
+    pub follow_output: bool,
     pub perf_overlay_enabled: bool,
     search: SearchState,
     rename: RenameState,
@@ -147,6 +177,13 @@ pub struct WindowState {
     last_busy_elapsed_secs: Option<u64>,
     bell_flash_was_active: bool,
     perf_stats: PerfStatsSnapshot,
+    mouse_pressed: Option<MouseButton>,
+    tab_drag_id: Option<TabId>,
+    cursor_blink_visible: bool,
+    cursor_blink_deadline: Option<Instant>,
+    blink_phase_changed: bool,
+    ime_composing: bool,
+    ime_preedit: String,
 }
 
 pub enum TabStripAction {
@@ -163,6 +200,8 @@ pub enum MenuAppAction {
     DetachTab,
     Quit,
     Theme(ThemeMode),
+    ToggleAlwaysOnTop,
+    SwitchProfile(String),
 }
 
 impl WindowState {
@@ -184,6 +223,9 @@ impl WindowState {
         } else {
             sidebar_width
         };
+        if config.window.decorations == crate::config::WindowDecorations::Native {
+            chrome_metrics.title_bar.height = 0.0;
+        }
         let layout = TerminalLayout::from_pixels(
             window.inner_size(),
             window.scale_factor(),
@@ -201,6 +243,8 @@ impl WindowState {
             layout,
             view_mode: ViewMode::from(config.ui.view_mode),
             panes: Vec::new(),
+            focused_pane: 0,
+            split_drag: None,
             modifiers: ModifiersState::empty(),
             pending_pty_layouts: Vec::new(),
             pty_resize_deadline: None,
@@ -217,6 +261,7 @@ impl WindowState {
             sidebar_collapsed: config.ui.sidebar_collapsed,
             font_zoom: config.ui.font_zoom,
             terminal_opacity,
+            follow_output: config.ui.follow_output,
             perf_overlay_enabled: false,
             search: SearchState::default(),
             rename: RenameState::default(),
@@ -237,6 +282,13 @@ impl WindowState {
             last_busy_elapsed_secs: None,
             bell_flash_was_active: false,
             perf_stats: PerfStatsSnapshot::default(),
+            mouse_pressed: None,
+            tab_drag_id: None,
+            cursor_blink_visible: true,
+            cursor_blink_deadline: None,
+            blink_phase_changed: false,
+            ime_composing: false,
+            ime_preedit: String::new(),
         }
     }
 
@@ -259,6 +311,9 @@ impl WindowState {
         } else {
             sidebar_width
         };
+        if config.window.decorations == crate::config::WindowDecorations::Native {
+            chrome_metrics.title_bar.height = 0.0;
+        }
         let layout = TerminalLayout::from_pixels(
             window.inner_size(),
             window.scale_factor(),
@@ -277,8 +332,11 @@ impl WindowState {
             view_mode: ViewMode::Single,
             panes: vec![PaneSlot {
                 tab_index: 0,
+                leaf_id: 0,
                 layout,
             }],
+            focused_pane: 0,
+            split_drag: None,
             modifiers: ModifiersState::empty(),
             pending_pty_layouts: Vec::new(),
             pty_resize_deadline: None,
@@ -295,6 +353,7 @@ impl WindowState {
             sidebar_collapsed,
             font_zoom,
             terminal_opacity,
+            follow_output: config.ui.follow_output,
             perf_overlay_enabled: false,
             search: SearchState::default(),
             rename: RenameState::default(),
@@ -315,6 +374,13 @@ impl WindowState {
             last_busy_elapsed_secs: None,
             bell_flash_was_active: false,
             perf_stats: PerfStatsSnapshot::default(),
+            mouse_pressed: None,
+            tab_drag_id: None,
+            cursor_blink_visible: true,
+            cursor_blink_deadline: None,
+            blink_phase_changed: false,
+            ime_composing: false,
+            ime_preedit: String::new(),
         }
     }
 
@@ -374,6 +440,9 @@ impl WindowState {
             self.effective_font_size(config),
             self.window.scale_factor() as f32,
         );
+        if config.window.decorations == crate::config::WindowDecorations::Native {
+            metrics.title_bar.height = 0.0;
+        }
         metrics.tab_strip.width = if self.sidebar_collapsed {
             collapsed_sidebar_width(self.window.scale_factor() as f32)
         } else {
@@ -403,11 +472,10 @@ impl WindowState {
     }
 
     pub fn focused_pane_slot(&self) -> usize {
-        let active = self.tabs.active_index();
-        self.panes
-            .iter()
-            .position(|pane| pane.tab_index == active)
-            .unwrap_or(0)
+        if self.panes.is_empty() {
+            return 0;
+        }
+        self.focused_pane.min(self.panes.len() - 1)
     }
 
     pub fn recompute_panes(&mut self, config: &Config) {
@@ -432,11 +500,52 @@ impl WindowState {
                     return;
                 }
                 let active = self.tabs.active_index();
-                self.panes = vec![PaneSlot {
-                    tab_index: active,
-                    layout: base,
-                }];
-                self.layout = base;
+                let content = ContentRect {
+                    x0: content_x,
+                    y0: content_y,
+                    x1: content_x + content_w,
+                    y1: content_y + content_h,
+                };
+                let mut leaf_counter = 0;
+                let entries = self
+                    .tabs
+                    .tab_at_index(active)
+                    .map(|tab| tab.root.layout_entries(content, &mut leaf_counter))
+                    .unwrap_or_default();
+                self.panes = entries
+                    .iter()
+                    .map(|entry| PaneSlot {
+                        tab_index: active,
+                        leaf_id: entry.leaf_id,
+                        layout: TerminalLayout::from_rect(
+                            entry.rect.x0,
+                            entry.rect.y0,
+                            entry.rect.width(),
+                            entry.rect.height(),
+                            scale,
+                            font_size,
+                        ),
+                    })
+                    .collect();
+                if let Some(tab) = self.tabs.tab_at_index_mut(active) {
+                    if tab.focused_leaf >= tab.leaf_count() {
+                        tab.focused_leaf = 0;
+                    }
+                }
+                self.layout = self
+                    .panes
+                    .iter()
+                    .find(|pane| {
+                        pane.tab_index == active
+                            && self
+                                .tabs
+                                .tab_at_index(active)
+                                .map(|tab| pane.leaf_id == tab.focused_leaf)
+                                .unwrap_or(false)
+                    })
+                    .map(|pane| pane.layout)
+                    .or_else(|| self.panes.first().map(|pane| pane.layout))
+                    .unwrap_or(base);
             }
             ViewMode::Grid => {
                 let n = self.tabs.len().min(MAX_GRID_PANES);
@@ -452,6 +561,7 @@ impl WindowState {
                     .enumerate()
                     .map(|(index, rect)| PaneSlot {
                         tab_index: index,
+                        leaf_id: 0,
                         layout: TerminalLayout::from_rect(
                             rect.x0,
                             rect.y0,
@@ -473,6 +583,10 @@ impl WindowState {
             }
         }
 
+        if self.focused_pane >= self.panes.len() {
+            self.focused_pane = self.panes.len().saturating_sub(1);
+        }
+
         self.ensure_pane_buffers(self.panes.len());
 
         if let Some(renderer) = self.renderer.as_mut() {
@@ -482,32 +596,23 @@ impl WindowState {
         }
     }
 
-    fn pane_layout_for_tab(&self, tab_index: usize, full_layout: TerminalLayout) -> TerminalLayout {
-        self.panes
-            .iter()
-            .find(|pane| pane.tab_index == tab_index)
-            .map(|pane| pane.layout)
-            .unwrap_or(full_layout)
-    }
-
     fn resize_all_pane_terminals(&mut self, config: &Config) -> bool {
-        let full_layout = self.terminal_layout_for_size(
-            config,
-            self.window.inner_size(),
-            self.window.scale_factor(),
-        );
+        let _ = config;
         let mut any_grid_changed = false;
 
-        for tab_index in 0..self.tabs.len() {
-            let layout = self.pane_layout_for_tab(tab_index, full_layout);
-            if let Some(tab) = self.tabs.tab_at_index_mut(tab_index) {
-                let mut term = tab.session.terminal.lock();
-                if term.columns() != layout.cols as usize
-                    || term.screen_lines() != layout.rows as usize
-                {
-                    any_grid_changed = true;
-                    term.resize(layout);
-                }
+        for pane in &self.panes {
+            let Some(tab) = self.tabs.tab_at_index_mut(pane.tab_index) else {
+                continue;
+            };
+            let Some(session) = tab.leaf_session_mut(pane.leaf_id) else {
+                continue;
+            };
+            let mut term = session.terminal.lock();
+            if term.columns() != pane.layout.cols as usize
+                || term.screen_lines() != pane.layout.rows as usize
+            {
+                any_grid_changed = true;
+                term.resize(pane.layout);
             }
         }
 
@@ -518,30 +623,25 @@ impl WindowState {
     }
 
     fn notify_all_pane_ptys(&mut self, config: &Config) {
-        let full_layout = self.terminal_layout_for_size(
-            config,
-            self.window.inner_size(),
-            self.window.scale_factor(),
-        );
-        for tab_index in 0..self.tabs.len() {
-            let layout = self.pane_layout_for_tab(tab_index, full_layout);
-            self.notify_pty_resize_tab(tab_index, layout);
+        let _ = config;
+        for pane in &self.panes {
+            if let Some(tab) = self.tabs.tab_at_index_mut(pane.tab_index) {
+                if let Some(session) = tab.leaf_session_mut(pane.leaf_id) {
+                    session.notifier.on_resize(pane.layout.window_size());
+                }
+            }
         }
     }
 
     pub fn apply_pane_layouts(&mut self, config: &Config, event_loop: &ActiveEventLoop) {
-        let full_layout = self.terminal_layout_for_size(
-            config,
-            self.window.inner_size(),
-            self.window.scale_factor(),
-        );
-
         if !self.resize_all_pane_terminals(config) {
             return;
         }
 
-        self.pending_pty_layouts = (0..self.tabs.len())
-            .map(|tab_index| (tab_index, self.pane_layout_for_tab(tab_index, full_layout)))
+        self.pending_pty_layouts = self
+            .panes
+            .iter()
+            .map(|pane| (pane.tab_index, pane.leaf_id, pane.layout))
             .collect();
         self.schedule_pty_resize(event_loop);
     }
@@ -595,6 +695,7 @@ impl WindowState {
             return;
         };
         let tab_index = pane.tab_index;
+        let leaf_id = pane.leaf_id;
         let layout = pane.layout;
         let Some(tab) = self.tabs.tab_at_index(tab_index) else {
             return;
@@ -603,6 +704,10 @@ impl WindowState {
         if !self.tabs.set_active(id) {
             return;
         }
+        if let Some(tab) = self.tabs.tab_at_index_mut(tab_index) {
+            tab.focused_leaf = leaf_id;
+        }
+        self.focused_pane = slot;
         self.layout = layout;
         if let Some(renderer) = self.renderer.as_mut() {
             renderer.set_layout(layout);
@@ -629,14 +734,76 @@ impl WindowState {
         None
     }
 
-    pub fn tab_index_for_scroll(&self, x: f64, y: f64) -> Option<usize> {
+    pub fn try_scrollbar_click(&mut self, x: f64, y: f64) -> bool {
+        const TRACK_W: f64 = 5.0;
+        let slot = match self.pane_at(x, y) {
+            Some(slot) => slot,
+            None => return false,
+        };
+        let pane = match self.panes.get(slot) {
+            Some(pane) => pane,
+            None => return false,
+        };
+        let layout = pane.layout;
+        let width = f64::from(layout.cell_width) * f64::from(layout.cols);
+        let height = f64::from(layout.cell_height) * f64::from(layout.rows);
+        let x_off = f64::from(layout.content_offset_x);
+        let y_off = f64::from(layout.content_offset_y);
+        let track_x = x_off + width - TRACK_W - 1.0;
+        if x < track_x || y < y_off || y >= y_off + height {
+            return false;
+        }
+
+        let tab_index = pane.tab_index;
+        let leaf_id = pane.leaf_id;
+        let tab = match self.tabs.tab_at_index_mut(tab_index) {
+            Some(tab) => tab,
+            None => return false,
+        };
+        let session = match tab.leaf_session_mut(leaf_id) {
+            Some(session) => session,
+            None => return false,
+        };
+        let mut term = session.terminal.lock();
+        let scroll_history = term
+            .grid()
+            .total_lines()
+            .saturating_sub(term.grid().screen_lines());
+        if scroll_history == 0 {
+            return false;
+        }
+
+        let visible = layout.rows as f64;
+        let total = visible + scroll_history as f64;
+        let thumb_h = (height * (visible / total)).max(12.0);
+        let track_h = (height - thumb_h).max(1.0);
+        let frac = ((y - y_off) / track_h).clamp(0.0, 1.0);
+        let target_offset = ((1.0 - frac) * scroll_history as f64).round() as i32;
+        let current = term.grid().display_offset() as i32;
+        let delta = target_offset - current;
+        if delta != 0 {
+            term.scroll_display(Scroll::Delta(delta));
+        }
+        drop(term);
+        self.needs_redraw = true;
+        self.request_redraw();
+        true
+    }
+
+    pub fn tab_index_for_scroll(&self, x: f64, y: f64) -> Option<(usize, usize)> {
         if self.view_mode == ViewMode::Grid {
-            self.pane_at(x, y)
-                .and_then(|slot| self.panes.get(slot).map(|pane| pane.tab_index))
+            self.pane_at(x, y).and_then(|slot| {
+                self.panes
+                    .get(slot)
+                    .map(|pane| (pane.tab_index, pane.leaf_id))
+            })
         } else if self.tabs.is_empty() {
             None
         } else {
-            Some(self.tabs.active_index())
+            let slot = self.pane_at(x, y).unwrap_or(self.focused_pane_slot());
+            self.panes
+                .get(slot)
+                .map(|pane| (pane.tab_index, pane.leaf_id))
         }
     }
 
@@ -658,20 +825,14 @@ impl WindowState {
             return None;
         }
 
-        url_in_row(frame.rows.get(row)?, pane.layout.cols as usize, col)
+        links::url_at_position(&frame.rows, pane.layout.cols as usize, row, col)
     }
 
     pub fn open_url_at_position(&self, x: f64, y: f64) -> bool {
         let Some(url) = self.url_at_position(x, y) else {
             return false;
         };
-        match std::process::Command::new("xdg-open").arg(&url).spawn() {
-            Ok(_) => true,
-            Err(error) => {
-                tracing::warn!(%error, %url, "failed to open URL");
-                false
-            }
-        }
+        crate::platform::open_url(&url)
     }
 
     pub fn tab_strip_layout_snapshot(&self) -> TabStripLayout {
@@ -760,21 +921,14 @@ impl WindowState {
 
         let id = TabId(*next_tab_id);
         *next_tab_id += 1;
-        let event_proxy = self.proxy_factory.for_tab(id);
         tracing::info!(
             cols = self.layout.cols,
             rows = self.layout.rows,
             "spawning initial tab"
         );
-        match PtySession::spawn_with_working_directory(config, self.layout, event_proxy, first_cwd)
-        {
+        match spawn_leaf_session(config, id, 0, self.layout, &self.proxy_factory, first_cwd) {
             Ok(session) => {
-                let tab = Tab {
-                    id,
-                    title: format!("Tab {}", id.0),
-                    session,
-                    running_since: None,
-                };
+                let tab = Tab::new(id, format!("Tab {}", id.0), session);
                 self.tabs = TabManager::with_initial(tab);
                 for cwd in restored_cwds.into_iter().skip(1).take(15) {
                     let _ = self.tabs.spawn_tab(
@@ -846,7 +1000,7 @@ impl WindowState {
         let working_directory = self
             .tabs
             .active_tab()
-            .and_then(|tab| tab.session.current_working_directory());
+            .and_then(|tab| tab.current_working_directory());
         if self
             .tabs
             .spawn_tab(
@@ -869,9 +1023,16 @@ impl WindowState {
         self.tabs.is_empty()
     }
 
-    pub fn notify_pty_resize_tab(&mut self, tab_index: usize, layout: TerminalLayout) {
+    pub fn notify_pty_resize_pane(
+        &mut self,
+        tab_index: usize,
+        leaf_id: usize,
+        layout: TerminalLayout,
+    ) {
         if let Some(tab) = self.tabs.tab_at_index_mut(tab_index) {
-            tab.session.notifier.on_resize(layout.window_size());
+            if let Some(session) = tab.leaf_session_mut(leaf_id) {
+                session.notifier.on_resize(layout.window_size());
+            }
         }
     }
 
@@ -920,8 +1081,8 @@ impl WindowState {
         }
 
         let layouts: Vec<_> = self.pending_pty_layouts.drain(..).collect();
-        for (tab_index, layout) in layouts {
-            self.notify_pty_resize_tab(tab_index, layout);
+        for (tab_index, leaf_id, layout) in layouts {
+            self.notify_pty_resize_pane(tab_index, leaf_id, layout);
         }
 
         self.needs_redraw = true;
@@ -930,9 +1091,25 @@ impl WindowState {
         event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
     }
 
-    pub fn handle_terminal_event(&mut self, config: &Config, tab_id: TabId, event: TerminalEvent) {
+    pub fn handle_terminal_event(
+        &mut self,
+        config: &Config,
+        tab_id: TabId,
+        leaf_id: usize,
+        event: TerminalEvent,
+    ) {
         match event {
             TerminalEvent::Wakeup => {
+                if self.follow_output {
+                    if let Some(tab) = self.tabs.tab_by_id(tab_id) {
+                        if let Some(session) = tab.leaf_session(leaf_id) {
+                            let mut term = session.terminal.lock();
+                            if term.grid().display_offset() == 0 {
+                                term.scroll_display(Scroll::Bottom);
+                            }
+                        }
+                    }
+                }
                 self.needs_redraw = true;
                 self.request_redraw();
             }
@@ -953,7 +1130,9 @@ impl WindowState {
             }
             TerminalEvent::PtyWrite(data) => {
                 if let Some(tab) = self.tabs.tab_by_id(tab_id) {
-                    tab.session.notifier.notify(Cow::Owned(data.into_bytes()));
+                    if let Some(session) = tab.leaf_session(leaf_id) {
+                        session.notifier.notify(Cow::Owned(data.into_bytes()));
+                    }
                 }
             }
             TerminalEvent::Bell => {
@@ -961,6 +1140,57 @@ impl WindowState {
                     self.bell_flash_until = Some(Instant::now() + BELL_FLASH_DURATION);
                     self.needs_redraw = true;
                     self.request_redraw();
+                }
+                if config.bell.audible {
+                    crate::platform::play_audible_bell();
+                }
+                if config.bell.urgency {
+                    self.window
+                        .request_user_attention(Some(winit::window::UserAttentionType::Critical));
+                }
+            }
+            TerminalEvent::CursorBlinkingChange => {
+                self.reset_cursor_blink_timer();
+                self.needs_redraw = true;
+                self.request_redraw();
+            }
+            TerminalEvent::ClipboardStore(clipboard_type, text) => {
+                match clipboard_type {
+                    ClipboardType::Clipboard => {
+                        copy_text(&text);
+                    }
+                    ClipboardType::Selection => {
+                        copy_primary(&text);
+                    }
+                }
+            }
+            TerminalEvent::ClipboardLoad(clipboard_type, respond) => {
+                if let Some(tab) = self.tabs.tab_by_id(tab_id) {
+                    if let Some(session) = tab.leaf_session(leaf_id) {
+                        let text = match clipboard_type {
+                            ClipboardType::Clipboard => paste_text(),
+                            ClipboardType::Selection => paste_primary(),
+                        }
+                        .unwrap_or_default();
+                        let response = respond(&text);
+                        session
+                            .notifier
+                            .notify(Cow::Owned(response.into_bytes()));
+                    }
+                }
+            }
+            TerminalEvent::ColorRequest(index, respond) => {
+                if let Some(tab) = self.tabs.tab_by_id(tab_id) {
+                    if let Some(session) = tab.leaf_session(leaf_id) {
+                        let term = session.terminal.lock();
+                        let color =
+                            crate::terminal_setup::resolve_color_at_index(&term, config, index);
+                        drop(term);
+                        let response = respond(color);
+                        session
+                            .notifier
+                            .notify(Cow::Owned(response.into_bytes()));
+                    }
                 }
             }
             TerminalEvent::Exit => {}
@@ -992,28 +1222,250 @@ impl WindowState {
         let Some(tab) = self.tabs.active_tab() else {
             return;
         };
-        let term = tab.session.terminal.lock();
+        let Some(session) = tab.focused_session() else {
+            return;
+        };
+        let term = session.terminal.lock();
         if let Some(text) = term.selection_to_string() {
             if !text.is_empty() {
                 copy_text(&text);
+                copy_primary(&text);
             }
         }
     }
 
-    pub fn paste_from_clipboard(&mut self) {
-        let Some(text) = paste_text() else {
+    pub fn paste_from_clipboard(&mut self, config: &Config) {
+        self.paste_text(config, paste_text());
+    }
+
+    pub fn paste_primary(&mut self, config: &Config) {
+        self.paste_text(config, paste_primary());
+    }
+
+    fn paste_text(&mut self, config: &Config, text: Option<String>) {
+        let Some(mut text) = text else {
             return;
         };
+        if config.terminal.sanitize_paste {
+            text = sanitize_paste(&text);
+        }
+        if text.is_empty() {
+            return;
+        }
         if let Some(tab) = self.tabs.active_tab() {
-            tab.session.notifier.notify(Cow::Owned(text.into_bytes()));
+            let payload = {
+                let Some(session) = tab.focused_session() else {
+                    return;
+                };
+                let term = session.terminal.lock();
+                if term.mode().contains(TermMode::BRACKETED_PASTE) {
+                    format!("\x1b[200~{text}\x1b[201~")
+                } else {
+                    text
+                }
+            };
+            if let Some(session) = tab.focused_session() {
+                session.notifier.notify(Cow::Owned(payload.into_bytes()));
+            }
+        }
+    }
+
+    pub fn terminal_input_state(&self) -> (TermMode, vte::ansi::ModifyOtherKeys, bool) {
+        let (mode, modify_other_keys) = self
+            .tabs
+            .active_tab()
+            .and_then(|tab| tab.focused_session())
+            .map(|session| {
+                (
+                    *session.terminal.lock().mode(),
+                    session.modify_other_keys(),
+                )
+            })
+            .unwrap_or((TermMode::empty(), vte::ansi::ModifyOtherKeys::Reset));
+        (mode, modify_other_keys, self.ime_composing)
+    }
+
+    pub fn send_bytes_to_pane(&self, tab_index: usize, leaf_id: usize, bytes: Vec<u8>) {
+        if let Some(tab) = self.tabs.tab_at_index(tab_index) {
+            if let Some(session) = tab.leaf_session(leaf_id) {
+                session.notifier.notify(Cow::Owned(bytes));
+            }
+        }
+    }
+
+    fn layout_at_terminal(&self, x: f64, y: f64) -> Option<TerminalLayout> {
+        if self.view_mode == ViewMode::Grid {
+            self.pane_at(x, y)
+                .and_then(|slot| self.panes.get(slot).map(|pane| pane.layout))
+        } else {
+            Some(self.layout)
+        }
+    }
+
+    fn term_mode_for_pane(&self, tab_index: usize, leaf_id: usize) -> Option<TermMode> {
+        let tab = self.tabs.tab_at_index(tab_index)?;
+        let session = tab.leaf_session(leaf_id)?;
+        Some(*session.terminal.lock().mode())
+    }
+
+    fn pane_at_cursor(&self, x: f64, y: f64) -> Option<(usize, usize, usize)> {
+        let slot = self.pane_at(x, y)?;
+        let pane = self.panes.get(slot)?;
+        Some((slot, pane.tab_index, pane.leaf_id))
+    }
+
+    pub fn mouse_should_report(&self, x: f64, y: f64) -> bool {
+        if self.modifiers.shift_key() {
+            return false;
+        }
+        self.pane_at_cursor(x, y)
+            .and_then(|(_, tab_index, leaf_id)| self.term_mode_for_pane(tab_index, leaf_id))
+            .map(mouse::mouse_mode_active)
+            .unwrap_or(false)
+    }
+
+    pub fn grid_point_at_terminal(&self, x: f64, y: f64) -> Option<(usize, usize, Point)> {
+        let (_, tab_index, leaf_id) = self.pane_at_cursor(x, y)?;
+        let layout = self.layout_at_terminal(x, y)?;
+        let tab = self.tabs.tab_at_index(tab_index)?;
+        let session = tab.leaf_session(leaf_id)?;
+        let display_offset = session.terminal.lock().grid().display_offset();
+        let point = mouse::grid_point_from_layout(&layout, display_offset, x, y);
+        Some((tab_index, leaf_id, point))
+    }
+
+    pub fn try_report_mouse_wheel(&mut self, lines: i32, x: f64, y: f64) -> bool {
+        if lines == 0 || self.modifiers.control_key() || !self.mouse_should_report(x, y) {
+            return false;
+        }
+        let Some((tab_index, leaf_id, point)) = self.grid_point_at_terminal(x, y) else {
+            return false;
+        };
+        let mode = self
+            .term_mode_for_pane(tab_index, leaf_id)
+            .unwrap_or(TermMode::empty());
+        let button = mouse::wheel_button(lines);
+        let bytes =
+            mouse::encode_mouse_report(point, button, ElementState::Pressed, self.modifiers, mode);
+        self.send_bytes_to_pane(tab_index, leaf_id, bytes);
+        true
+    }
+
+    pub fn try_report_mouse_motion(&mut self, x: f64, y: f64) -> bool {
+        if !self.mouse_should_report(x, y) {
+            return false;
+        }
+        let Some((tab_index, leaf_id, point)) = self.grid_point_at_terminal(x, y) else {
+            return false;
+        };
+        let mode = self
+            .term_mode_for_pane(tab_index, leaf_id)
+            .unwrap_or(TermMode::empty());
+        let report_motion = mode.contains(TermMode::MOUSE_MOTION)
+            || (mode.contains(TermMode::MOUSE_DRAG) && self.mouse_pressed.is_some());
+        if !report_motion {
+            return false;
+        }
+        let button = mouse::motion_button(self.mouse_pressed);
+        let bytes =
+            mouse::encode_mouse_report(point, button, ElementState::Pressed, self.modifiers, mode);
+        self.send_bytes_to_pane(tab_index, leaf_id, bytes);
+        true
+    }
+
+    pub fn try_report_mouse_button(
+        &mut self,
+        button: MouseButton,
+        state: ElementState,
+        x: f64,
+        y: f64,
+    ) -> bool {
+        if !self.mouse_should_report(x, y) {
+            return false;
+        }
+        let Some((tab_index, leaf_id, point)) = self.grid_point_at_terminal(x, y) else {
+            return false;
+        };
+        let mode = self
+            .term_mode_for_pane(tab_index, leaf_id)
+            .unwrap_or(TermMode::empty());
+        let code = mouse::button_code(button);
+        let bytes = mouse::encode_mouse_report(point, code, state, self.modifiers, mode);
+        self.send_bytes_to_pane(tab_index, leaf_id, bytes);
+        match state {
+            ElementState::Pressed => self.mouse_pressed = Some(button),
+            ElementState::Released if self.mouse_pressed == Some(button) => {
+                self.mouse_pressed = None;
+            }
+            _ => {}
+        }
+        true
+    }
+
+    pub fn handle_window_focus(&self, focused: bool) {
+        let Some(tab) = self.tabs.active_tab() else {
+            return;
+        };
+        let Some(session) = tab.focused_session() else {
+            return;
+        };
+        let should_report = session
+            .terminal
+            .lock()
+            .mode()
+            .contains(TermMode::FOCUS_IN_OUT);
+        if !should_report {
+            return;
+        }
+        let bytes = if focused {
+            b"\x1b[I".to_vec()
+        } else {
+            b"\x1b[O".to_vec()
+        };
+        session.notifier.notify(Cow::Owned(bytes));
+    }
+
+    pub fn handle_ime(&mut self, ime: winit::event::Ime) {
+        use winit::event::Ime;
+
+        match ime {
+            Ime::Enabled => {
+                self.ime_composing = true;
+                self.ime_preedit.clear();
+            }
+            Ime::Preedit(text, _) => {
+                self.ime_composing = true;
+                self.ime_preedit = text;
+                self.needs_redraw = true;
+                self.request_redraw();
+            }
+            Ime::Commit(text) => {
+                self.ime_composing = false;
+                self.ime_preedit.clear();
+                if let Some(tab) = self.tabs.active_tab() {
+                    if let Some(session) = tab.focused_session() {
+                        session.notifier.notify(Cow::Owned(text.into_bytes()));
+                    }
+                }
+                self.needs_redraw = true;
+                self.request_redraw();
+            }
+            Ime::Disabled => {
+                self.ime_composing = false;
+                self.ime_preedit.clear();
+                self.needs_redraw = true;
+                self.request_redraw();
+            }
         }
     }
 
     pub fn clear_scrollback(&mut self) {
         if let Some(tab) = self.tabs.active_tab() {
-            let mut term = tab.session.terminal.lock();
-            term.grid_mut().clear_history();
-            term.scroll_display(Scroll::Bottom);
+            if let Some(session) = tab.focused_session() {
+                let mut term = session.terminal.lock();
+                term.grid_mut().clear_history();
+                term.scroll_display(Scroll::Bottom);
+            }
         }
         self.request_full_capture();
         self.needs_redraw = true;
@@ -1048,7 +1500,7 @@ impl WindowState {
         self.request_redraw();
     }
 
-    pub fn build_menu_entries(&self, theme_mode: ThemeMode) -> Vec<MenuEntry> {
+    pub fn build_menu_entries(&self, config: &Config, theme_mode: ThemeMode) -> Vec<MenuEntry> {
         vec![
             MenuEntry::Action {
                 action: MenuAction::NewTab,
@@ -1061,6 +1513,14 @@ impl WindowState {
             MenuEntry::Action {
                 action: MenuAction::RenameTab,
                 label: "Rename Tab".to_owned(),
+            },
+            MenuEntry::Action {
+                action: MenuAction::ToggleTabPin,
+                label: "Pin / Unpin Tab".to_owned(),
+            },
+            MenuEntry::Action {
+                action: MenuAction::CycleTabColor,
+                label: "Set Tab Color".to_owned(),
             },
             MenuEntry::Action {
                 action: MenuAction::CloseTab,
@@ -1082,6 +1542,13 @@ impl WindowState {
             MenuEntry::Action {
                 action: MenuAction::ClearScrollback,
                 label: "Clear Scrollback".to_owned(),
+            },
+            MenuEntry::Action {
+                action: MenuAction::ToggleFollowOutput,
+                label: format!(
+                    "Scroll on Output: {}",
+                    if self.follow_output { "On" } else { "Off" }
+                ),
             },
             MenuEntry::Separator,
             MenuEntry::ViewSelector {
@@ -1118,6 +1585,21 @@ impl WindowState {
                     }
                 ),
             },
+            MenuEntry::Action {
+                action: MenuAction::ToggleFullscreen,
+                label: "Toggle Fullscreen".to_owned(),
+            },
+            MenuEntry::Action {
+                action: MenuAction::ToggleAlwaysOnTop,
+                label: format!(
+                    "Always on Top: {}",
+                    if config.window.always_on_top {
+                        "On"
+                    } else {
+                        "Off"
+                    }
+                ),
+            },
             MenuEntry::Separator,
             MenuEntry::Action {
                 action: MenuAction::Quit,
@@ -1128,15 +1610,15 @@ impl WindowState {
 
     /// Apply an opacity value chosen via the slider and refresh the open menu so
     /// the knob and percentage label track the change.
-    pub fn apply_slider_opacity(&mut self, theme_mode: ThemeMode, value: f32) {
+    pub fn apply_slider_opacity(&mut self, config: &Config, theme_mode: ThemeMode, value: f32) {
         self.apply_terminal_opacity(value);
         if self.menu_open {
-            self.refresh_menu_entries(theme_mode);
+            self.refresh_menu_entries(config, theme_mode);
         }
     }
 
-    pub fn refresh_menu_entries(&mut self, theme_mode: ThemeMode) {
-        self.menu_entries = self.build_menu_entries(theme_mode);
+    pub fn refresh_menu_entries(&mut self, config: &Config, theme_mode: ThemeMode) {
+        self.menu_entries = self.build_menu_entries(config, theme_mode);
         self.mark_chrome_dirty();
     }
 
@@ -1152,20 +1634,6 @@ impl WindowState {
             return (false, None);
         }
 
-        if modifiers.control_key() && modifiers.shift_key() {
-            if let Key::Character(text) = &event.logical_key {
-                if text.eq_ignore_ascii_case("p") {
-                    self.command_palette.active = true;
-                    self.command_palette.query.clear();
-                    self.search.active = false;
-                    self.dismiss_menu();
-                    self.needs_redraw = true;
-                    self.request_redraw();
-                    return (true, None);
-                }
-            }
-        }
-
         if !self.command_palette.active {
             return (false, None);
         }
@@ -1177,20 +1645,52 @@ impl WindowState {
             }
             Key::Named(NamedKey::Backspace) => {
                 self.command_palette.query.pop();
+                self.command_palette.selected_index = 0;
+                self.clamp_palette_selection(config);
             }
-            Key::Named(NamedKey::Enter) => match self.filtered_palette_items().first() {
-                Some(PaletteItem::Command { action, .. }) => {
-                    self.command_palette.active = false;
-                    app_action = self.handle_menu_action(config, theme_mode, *action, event_loop);
+            Key::Named(NamedKey::ArrowUp) => {
+                let count = self.filtered_palette_items(config).len();
+                if count > 0 {
+                    self.command_palette.selected_index =
+                        if self.command_palette.selected_index == 0 {
+                            count - 1
+                        } else {
+                            self.command_palette.selected_index - 1
+                        };
                 }
-                Some(PaletteItem::Tab { id, .. }) => {
-                    self.command_palette.active = false;
-                    self.focus_tab(*id, config);
+            }
+            Key::Named(NamedKey::ArrowDown) => {
+                let count = self.filtered_palette_items(config).len();
+                if count > 0 {
+                    self.command_palette.selected_index =
+                        (self.command_palette.selected_index + 1) % count;
                 }
-                None => {}
-            },
+            }
+            Key::Named(NamedKey::Enter) => {
+                match self
+                    .filtered_palette_items(config)
+                    .get(self.command_palette.selected_index)
+                {
+                    Some(PaletteItem::Command { action, .. }) => {
+                        self.command_palette.active = false;
+                        app_action =
+                            self.handle_menu_action(config, theme_mode, *action, event_loop);
+                    }
+                    Some(PaletteItem::Tab { id, .. }) => {
+                        self.command_palette.active = false;
+                        self.focus_tab(*id, config);
+                    }
+                    Some(PaletteItem::Profile { name }) => {
+                        self.command_palette.active = false;
+                        app_action = Some(MenuAppAction::SwitchProfile(name.clone()));
+                    }
+                    None => {}
+                }
+            }
             Key::Character(text) if !modifiers.control_key() && !modifiers.alt_key() => {
                 self.command_palette.query.push_str(text);
+                self.command_palette.selected_index = 0;
+                self.clamp_palette_selection(config);
             }
             _ => {}
         }
@@ -1200,12 +1700,31 @@ impl WindowState {
         (true, app_action)
     }
 
-    fn filtered_palette_items(&self) -> Vec<PaletteItem> {
+    fn clamp_palette_selection(&mut self, config: &Config) {
+        let count = self.filtered_palette_items(config).len();
+        if count == 0 {
+            self.command_palette.selected_index = 0;
+        } else if self.command_palette.selected_index >= count {
+            self.command_palette.selected_index = count - 1;
+        }
+    }
+
+    fn filtered_palette_items(&self, config: &Config) -> Vec<PaletteItem> {
         let query = self.command_palette.query.to_ascii_lowercase();
         let mut items = Vec::new();
 
+        for name in &config.profile_names {
+            let label = format!("Profile: {name}");
+            if query.is_empty() || fuzzy_score(&query, &label).is_some() {
+                items.push(PaletteItem::Profile {
+                    name: name.clone(),
+                });
+            }
+        }
+
         for info in self.tabs.infos() {
-            if query.is_empty() || info.title.to_ascii_lowercase().contains(&query) {
+            let label = format!("Tab: {}", info.title);
+            if query.is_empty() || fuzzy_score(&query, &label).is_some() {
                 items.push(PaletteItem::Tab {
                     id: info.id,
                     title: info.title,
@@ -1213,24 +1732,44 @@ impl WindowState {
             }
         }
 
+        let mut commands: Vec<(i32, PaletteItem)> = Vec::new();
         for cmd in palette_commands() {
-            if query.is_empty() || cmd.label.to_ascii_lowercase().contains(&query) {
-                items.push(PaletteItem::Command {
-                    label: cmd.label,
-                    action: cmd.action,
-                });
+            if query.is_empty() {
+                commands.push((
+                    0,
+                    PaletteItem::Command {
+                        label: cmd.label,
+                        action: cmd.action,
+                    },
+                ));
+            } else if let Some(score) = fuzzy_score(&query, cmd.label) {
+                commands.push((
+                    score,
+                    PaletteItem::Command {
+                        label: cmd.label,
+                        action: cmd.action,
+                    },
+                ));
             }
         }
-
+        commands.sort_by(|a, b| b.0.cmp(&a.0));
+        items.extend(commands.into_iter().map(|(_, item)| item));
         items
     }
 
-    fn command_palette_labels(&self) -> Vec<String> {
-        self.filtered_palette_items()
+    fn command_palette_labels(&self, config: &Config) -> Vec<String> {
+        self.filtered_palette_items(config)
             .into_iter()
             .map(|item| match item {
                 PaletteItem::Tab { title, .. } => format!("Tab: {title}"),
-                PaletteItem::Command { label, .. } => label.to_owned(),
+                PaletteItem::Profile { name } => format!("Profile: {name}"),
+                PaletteItem::Command { label, action } => {
+                    if let Some(hint) = menu_action_key_hint(action, &config.keybindings) {
+                        format!("{label}    {hint}")
+                    } else {
+                        label.to_owned()
+                    }
+                }
             })
             .collect()
     }
@@ -1331,20 +1870,6 @@ impl WindowState {
             return false;
         }
 
-        if modifiers.control_key() && modifiers.shift_key() {
-            if let Key::Character(text) = &event.logical_key {
-                if text.eq_ignore_ascii_case("f") {
-                    self.search.active = true;
-                    self.search.current_match = 0;
-                    self.dismiss_menu();
-                    self.request_full_capture();
-                    self.needs_redraw = true;
-                    self.request_redraw();
-                    return true;
-                }
-            }
-        }
-
         if !self.search.active {
             return false;
         }
@@ -1358,6 +1883,7 @@ impl WindowState {
             Key::Named(NamedKey::Backspace) => {
                 self.search.query.pop();
                 self.search.current_match = 0;
+                self.refresh_search_global_matches();
                 self.request_full_capture();
             }
             Key::Named(NamedKey::Enter) if self.search.match_count > 0 => {
@@ -1371,12 +1897,41 @@ impl WindowState {
                     self.search.current_match =
                         (self.search.current_match + 1) % self.search.match_count;
                 }
+                self.scroll_to_current_search_match();
                 self.request_full_capture();
             }
             Key::Named(NamedKey::Enter) => {}
+            Key::Character(text)
+                if (text == "c" || text == "C")
+                    && ((modifiers.control_key() && modifiers.shift_key())
+                        || (modifiers.alt_key() && !modifiers.control_key())) =>
+            {
+                self.search.case_sensitive = !self.search.case_sensitive;
+                self.refresh_search_global_matches();
+                self.request_full_capture();
+            }
+            Key::Character(text)
+                if (text == "r" || text == "R")
+                    && modifiers.alt_key()
+                    && !modifiers.control_key() =>
+            {
+                self.search.use_regex = !self.search.use_regex;
+                self.refresh_search_global_matches();
+                self.request_full_capture();
+            }
+            Key::Character(text)
+                if (text == "w" || text == "W")
+                    && modifiers.alt_key()
+                    && !modifiers.control_key() =>
+            {
+                self.search.whole_word = !self.search.whole_word;
+                self.refresh_search_global_matches();
+                self.request_full_capture();
+            }
             Key::Character(text) if !modifiers.control_key() && !modifiers.alt_key() => {
                 self.search.query.push_str(text);
                 self.search.current_match = 0;
+                self.refresh_search_global_matches();
                 self.request_full_capture();
             }
             _ => {}
@@ -1409,11 +1964,28 @@ impl WindowState {
         selection_type: SelectionType,
         copy_immediately: bool,
     ) {
-        if let Some(tab) = self.tabs.active_tab() {
-            let mut term = tab.session.terminal.lock();
-            let point = self.grid_point_from_position(term.grid().display_offset(), x, y);
-            let side = self.side_from_position(x);
-            term.selection = Some(Selection::new(selection_type, point, side));
+        let slot = self.focused_pane_slot();
+        let Some(pane) = self.panes.get(slot).copied() else {
+            return;
+        };
+        let layout = pane.layout;
+        let (point, side) = {
+            let Some(tab) = self.tabs.tab_at_index(pane.tab_index) else {
+                return;
+            };
+            let Some(session) = tab.leaf_session(pane.leaf_id) else {
+                return;
+            };
+            let term = session.terminal.lock();
+            let point = self.grid_point_from_layout(layout, term.grid().display_offset(), x, y);
+            let side = self.side_from_layout(layout, x);
+            (point, side)
+        };
+        if let Some(tab) = self.tabs.tab_at_index_mut(pane.tab_index) {
+            if let Some(session) = tab.leaf_session_mut(pane.leaf_id) {
+                let mut term = session.terminal.lock();
+                term.selection = Some(Selection::new(selection_type, point, side));
+            }
         }
         if copy_immediately {
             self.copy_selection();
@@ -1423,17 +1995,72 @@ impl WindowState {
         self.request_redraw();
     }
 
+    pub fn update_selection_drag(&mut self, x: f64, y: f64) -> bool {
+        let slot = self.focused_pane_slot();
+        let Some(pane) = self.panes.get(slot).copied() else {
+            return false;
+        };
+        let layout = pane.layout;
+        let (point, side) = {
+            let Some(tab) = self.tabs.tab_at_index(pane.tab_index) else {
+                return false;
+            };
+            let Some(session) = tab.leaf_session(pane.leaf_id) else {
+                return false;
+            };
+            let term = session.terminal.lock();
+            let point = self.grid_point_from_layout(layout, term.grid().display_offset(), x, y);
+            let side = self.side_from_layout(layout, x);
+            (point, side)
+        };
+        if let Some(tab) = self.tabs.tab_at_index_mut(pane.tab_index) {
+            if let Some(session) = tab.leaf_session_mut(pane.leaf_id) {
+                let mut term = session.terminal.lock();
+                if let Some(selection) = term.selection.as_mut() {
+                    selection.update(point, side);
+                }
+            }
+        }
+        self.request_full_capture();
+        self.needs_redraw = true;
+        self.request_redraw();
+        true
+    }
+
+    pub fn begin_simple_selection(&mut self, x: f64, y: f64) {
+        self.selecting = true;
+        self.start_selection_at(x, y, SelectionType::Simple, false);
+    }
+
+    fn grid_point_from_layout(
+        &self,
+        layout: TerminalLayout,
+        display_offset: usize,
+        x: f64,
+        y: f64,
+    ) -> Point {
+        let x = x - f64::from(layout.content_offset_x);
+        let y = y - f64::from(layout.content_offset_y);
+        let col = (x / f64::from(layout.cell_width)).floor().max(0.0) as usize;
+        let row = (y / f64::from(layout.cell_height)).floor().max(0.0) as usize;
+        let max_row = layout.rows.saturating_sub(1) as usize;
+        let max_col = layout.cols.saturating_sub(1) as usize;
+        let viewport = Point::new(row.min(max_row), Column(col.min(max_col)));
+        viewport_to_point(display_offset, viewport)
+    }
+
+    fn side_from_layout(&self, layout: TerminalLayout, x: f64) -> Side {
+        let col = (x - f64::from(layout.content_offset_x)) / f64::from(layout.cell_width);
+        if col.fract() > 0.5 {
+            Side::Right
+        } else {
+            Side::Left
+        }
+    }
+
     pub fn bell_flash_active(&self) -> bool {
         self.bell_flash_until
             .is_some_and(|until| Instant::now() < until)
-    }
-
-    fn terminal_content_x(&self, x: f64) -> f64 {
-        x - f64::from(self.layout.content_offset_x)
-    }
-
-    fn terminal_content_y(&self, y: f64) -> f64 {
-        y - f64::from(self.layout.content_offset_y)
     }
 
     pub fn is_in_tab_strip(&self, x: f64, y: f64) -> bool {
@@ -1452,6 +2079,91 @@ impl WindowState {
         }
         let divider = f64::from(self.chrome_metrics.tab_strip.width);
         y >= f64::from(self.chrome_metrics.title_bar.height) && (x - divider).abs() <= HANDLE
+    }
+
+    fn terminal_content_rect(&self, config: &Config) -> ContentRect {
+        let base = self.terminal_layout_for_size(
+            config,
+            self.window.inner_size(),
+            self.window.scale_factor(),
+        );
+        let size = self.window.inner_size();
+        ContentRect {
+            x0: base.content_offset_x,
+            y0: base.content_offset_y,
+            x1: size.width as f32,
+            y1: size.height as f32,
+        }
+    }
+
+    pub fn split_divider_hit(&self, config: &Config, x: f64, y: f64) -> Option<SplitDividerHit> {
+        if self.view_mode != ViewMode::Single {
+            return None;
+        }
+        let tab = self.tabs.active_tab()?;
+        if tab.leaf_count() <= 1 {
+            return None;
+        }
+        let rect = self.terminal_content_rect(config);
+        let mut divider_index = 0;
+        let dividers = split_dividers(rect, &tab.root, &mut divider_index);
+        const HANDLE: f32 = 4.0;
+        dividers.into_iter().find(|hit| {
+            x as f32 >= hit.rect.x0 - HANDLE
+                && x as f32 <= hit.rect.x1 + HANDLE
+                && y as f32 >= hit.rect.y0 - HANDLE
+                && y as f32 <= hit.rect.y1 + HANDLE
+        })
+    }
+
+    pub fn start_split_divider_drag(&mut self, config: &Config, x: f64, y: f64) -> bool {
+        let Some(hit) = self.split_divider_hit(config, x, y) else {
+            return false;
+        };
+        self.split_drag = Some(SplitDragState {
+            divider_index: hit.index,
+            direction: hit.direction,
+            axis_span: hit.axis_span,
+            last_pos: (x, y),
+        });
+        true
+    }
+
+    pub fn apply_split_divider_drag(
+        &mut self,
+        config: &Config,
+        x: f64,
+        y: f64,
+        event_loop: &ActiveEventLoop,
+    ) {
+        let Some(drag) = self.split_drag.as_mut() else {
+            return;
+        };
+        let (dx, dy) = (x - drag.last_pos.0, y - drag.last_pos.1);
+        drag.last_pos = (x, y);
+        if drag.axis_span <= f32::EPSILON {
+            return;
+        }
+        let delta_ratio = match drag.direction {
+            SplitDirection::Horizontal => dx as f32 / drag.axis_span,
+            SplitDirection::Vertical => dy as f32 / drag.axis_span,
+        };
+        if delta_ratio.abs() < f32::EPSILON {
+            return;
+        }
+        if let Some(tab) = self.tabs.active_tab_mut() {
+            tab.root
+                .adjust_ratio_at_divider(drag.divider_index, delta_ratio);
+            self.sync_terminal_layout(config, event_loop);
+        }
+    }
+
+    pub fn end_split_divider_drag(&mut self) {
+        self.split_drag = None;
+    }
+
+    pub fn split_dragging(&self) -> bool {
+        self.split_drag.is_some()
     }
 
     pub fn toggle_sidebar_collapsed(&mut self, config: &Config, event_loop: &ActiveEventLoop) {
@@ -1483,33 +2195,10 @@ impl WindowState {
             && y >= f64::from(self.chrome_metrics.content_offset_y())
     }
 
-    fn viewport_point_from_position(&self, x: f64, y: f64) -> Point<usize> {
-        let x = self.terminal_content_x(x);
-        let y = self.terminal_content_y(y);
-        let col = (x / f64::from(self.layout.cell_width)).floor().max(0.0) as usize;
-        let row = (y / f64::from(self.layout.cell_height)).floor().max(0.0) as usize;
-        let max_row = self.layout.rows.saturating_sub(1) as usize;
-        let max_col = self.layout.cols.saturating_sub(1) as usize;
-        Point::new(row.min(max_row), Column(col.min(max_col)))
-    }
-
-    fn grid_point_from_position(&self, display_offset: usize, x: f64, y: f64) -> Point {
-        let viewport = self.viewport_point_from_position(x, y);
-        viewport_to_point(display_offset, viewport)
-    }
-
-    fn side_from_position(&self, x: f64) -> Side {
-        let col = self.terminal_content_x(x) / f64::from(self.layout.cell_width);
-        if col.fract() > 0.5 {
-            Side::Right
-        } else {
-            Side::Left
-        }
-    }
-
     pub fn tab_bar_entries(&self) -> Vec<TabBarEntry> {
         let now = Instant::now();
-        self.tabs
+        let mut entries: Vec<TabBarEntry> = self
+            .tabs
             .infos()
             .into_iter()
             .map(|info| TabBarEntry {
@@ -1521,26 +2210,26 @@ impl WindowState {
                 elapsed: info
                     .running_since
                     .map(|since| now.saturating_duration_since(since)),
+                pinned: info.pinned,
+                accent: info.accent,
             })
-            .collect()
+            .collect();
+        entries.sort_by_key(|entry| (!entry.pinned, entry.id.0));
+        entries
     }
 
-    pub fn refresh_tab_activity(&mut self) -> bool {
-        let now = Instant::now();
+    pub fn refresh_tab_activity(&mut self, heuristic_ms: u64) -> bool {
         let mut any_busy = false;
         let mut changed = false;
 
         for tab in self.tabs.iter_mut() {
-            if tab.session.is_busy() {
-                if tab.running_since.is_none() {
-                    tab.running_since = Some(now);
-                    changed = true;
-                }
-            } else if tab.running_since.take().is_some() {
+            let before = tab.running_since();
+            tab.refresh_running_since(heuristic_ms);
+            let after = tab.running_since();
+            if before != after {
                 changed = true;
             }
-
-            if tab.running_since.is_some() {
+            if after.is_some() {
                 any_busy = true;
             }
         }
@@ -1589,6 +2278,7 @@ impl WindowState {
         match layout.hit_test(x, y, self.tab_scroll_offset) {
             TabStripHit::Tab(id) => {
                 if button == MouseButton::Left {
+                    self.tab_drag_id = Some(id);
                     self.focus_tab(id, config);
                     TabStripAction::None
                 } else if button == MouseButton::Middle && self.close_tab(id, config, event_loop) {
@@ -1618,7 +2308,7 @@ impl WindowState {
 
     pub fn handle_title_bar_click(
         &mut self,
-        _config: &Config,
+        config: &Config,
         theme_mode: ThemeMode,
         x: f64,
         y: f64,
@@ -1637,10 +2327,16 @@ impl WindowState {
 
         match layout.hit_test(x, y) {
             TitleBarHit::Close => return true,
+            TitleBarHit::Minimize => {
+                self.window.set_minimized(true);
+            }
+            TitleBarHit::Maximize => {
+                self.window.set_maximized(!self.window.is_maximized());
+            }
             TitleBarHit::Hamburger => {
                 self.menu_open = !self.menu_open;
                 if self.menu_open {
-                    self.refresh_menu_entries(theme_mode);
+                    self.refresh_menu_entries(config, theme_mode);
                 } else {
                     self.mark_chrome_dirty();
                 }
@@ -1670,6 +2366,8 @@ impl WindowState {
                 | MenuAction::ViewSingle
                 | MenuAction::ViewGrid
                 | MenuAction::TogglePerfOverlay
+                | MenuAction::ToggleFullscreen
+                | MenuAction::ToggleFollowOutput
                 | MenuAction::ZoomIn
                 | MenuAction::ZoomOut
                 | MenuAction::ZoomReset
@@ -1686,6 +2384,19 @@ impl WindowState {
                 self.start_rename();
                 None
             }
+            MenuAction::ToggleTabPin => {
+                if let Some(id) = self.tabs.active_id() {
+                    self.toggle_tab_pin(id);
+                }
+                None
+            }
+            MenuAction::CycleTabColor => {
+                if let Some(id) = self.tabs.active_id() {
+                    self.cycle_tab_color(id);
+                }
+                None
+            }
+            MenuAction::ToggleAlwaysOnTop => Some(MenuAppAction::ToggleAlwaysOnTop),
             MenuAction::CloseTab => Some(MenuAppAction::CloseTab),
             MenuAction::DetachTab => Some(MenuAppAction::DetachTab),
             MenuAction::Copy => {
@@ -1693,7 +2404,7 @@ impl WindowState {
                 None
             }
             MenuAction::Paste => {
-                self.paste_from_clipboard();
+                self.paste_from_clipboard(config);
                 None
             }
             MenuAction::ClearScrollback => {
@@ -1718,6 +2429,17 @@ impl WindowState {
                 self.request_redraw();
                 None
             }
+            MenuAction::ToggleFullscreen => {
+                self.toggle_fullscreen();
+                None
+            }
+            MenuAction::ToggleFollowOutput => {
+                self.follow_output = !self.follow_output;
+                self.mark_chrome_dirty();
+                self.needs_redraw = true;
+                self.request_redraw();
+                None
+            }
             MenuAction::ZoomIn => {
                 self.apply_font_zoom(config, self.font_zoom + FONT_ZOOM_STEP, event_loop);
                 None
@@ -1734,7 +2456,7 @@ impl WindowState {
         };
 
         if self.menu_open {
-            self.refresh_menu_entries(theme_mode);
+            self.refresh_menu_entries(config, theme_mode);
             self.needs_redraw = true;
             self.request_redraw();
         }
@@ -1748,9 +2470,22 @@ impl WindowState {
         resize_direction_at(x, y, size.width as f64, size.height as f64, border)
     }
 
-    pub fn update_resize_cursor(&self, x: f64, y: f64) {
+    pub fn update_resize_cursor(&self, config: &Config, x: f64, y: f64) {
         let icon = if self.sidebar_dragging || self.sidebar_divider_hit(x, y) {
             CursorIcon::ColResize
+        } else if let Some(direction) =
+            self.split_drag
+                .as_ref()
+                .map(|drag| drag.direction)
+                .or_else(|| {
+                    self.split_divider_hit(config, x, y)
+                        .map(|hit| hit.direction)
+                })
+        {
+            match direction {
+                SplitDirection::Horizontal => CursorIcon::ColResize,
+                SplitDirection::Vertical => CursorIcon::RowResize,
+            }
         } else {
             self.resize_hit_at(x, y)
                 .map(cursor_for_direction)
@@ -1803,8 +2538,9 @@ impl WindowState {
                 None
             }
             KeyAction::SendToTerminal(bytes) => {
-                if let Some(tab) = self.tabs.active_tab() {
-                    tab.session.notifier.notify(Cow::Owned(bytes));
+                let slot = self.focused_pane_slot();
+                if let Some(pane) = self.panes.get(slot) {
+                    self.send_bytes_to_pane(pane.tab_index, pane.leaf_id, bytes);
                 }
                 None
             }
@@ -1813,7 +2549,7 @@ impl WindowState {
                 None
             }
             KeyAction::Paste => {
-                self.paste_from_clipboard();
+                self.paste_from_clipboard(config);
                 None
             }
             KeyAction::ZoomIn => {
@@ -1832,15 +2568,508 @@ impl WindowState {
                 self.clear_scrollback();
                 None
             }
+            KeyAction::OpenSearch => {
+                self.open_search();
+                None
+            }
+            KeyAction::OpenCommandPalette => {
+                self.open_command_palette();
+                None
+            }
+            KeyAction::SplitVertical
+            | KeyAction::SplitHorizontal
+            | KeyAction::ClosePane
+            | KeyAction::FocusPaneLeft
+            | KeyAction::FocusPaneRight
+            | KeyAction::FocusPaneUp
+            | KeyAction::FocusPaneDown
+            | KeyAction::ScrollPageUp
+            | KeyAction::ScrollPageDown
+            | KeyAction::JumpPromptPrev
+            | KeyAction::JumpPromptNext
+            | KeyAction::ToggleFullscreen => {
+                self.handle_extended_key_action(config, action, event_loop);
+                None
+            }
         }
     }
 
+    fn refresh_search_global_matches(&mut self) {
+        self.search.global_matches.clear();
+        self.search.match_count = 0;
+        if !self.search.active || self.search.query.is_empty() {
+            return;
+        }
+        let slot = self.focused_pane_slot();
+        let Some(pane) = self.panes.get(slot) else {
+            return;
+        };
+        let col_count = pane.layout.cols as usize;
+        let Some(tab) = self.tabs.tab_at_index(pane.tab_index) else {
+            return;
+        };
+        let Some(session) = tab.leaf_session(pane.leaf_id) else {
+            return;
+        };
+        let term = session.terminal.lock();
+        self.search.global_matches = search_scrollback(
+            &term,
+            &self.search.query,
+            col_count,
+            self.search.case_sensitive,
+            self.search.use_regex,
+            self.search.whole_word,
+            &mut self.search.regex_error,
+        );
+        self.search.match_count = self.search.global_matches.len();
+        if self.search.current_match >= self.search.match_count {
+            self.search.current_match = 0;
+        }
+    }
+
+    fn scroll_to_current_search_match(&mut self) {
+        if self.search.match_count == 0 {
+            return;
+        }
+        let grid_line = self.search.global_matches[self.search.current_match].grid_line;
+        let slot = self.focused_pane_slot();
+        let Some(pane) = self.panes.get(slot) else {
+            return;
+        };
+        let Some(tab) = self.tabs.tab_at_index_mut(pane.tab_index) else {
+            return;
+        };
+        let Some(session) = tab.leaf_session_mut(pane.leaf_id) else {
+            return;
+        };
+        let mut term = session.terminal.lock();
+        scroll_to_grid_line(&mut term, Line(grid_line));
+    }
+
+    pub fn open_search(&mut self) {
+        self.search.active = true;
+        self.search.current_match = 0;
+        self.command_palette.active = false;
+        self.dismiss_menu();
+        self.request_full_capture();
+        self.needs_redraw = true;
+        self.request_redraw();
+    }
+
+    pub fn open_command_palette(&mut self) {
+        self.command_palette.active = true;
+        self.command_palette.query.clear();
+        self.command_palette.selected_index = 0;
+        self.search.active = false;
+        self.dismiss_menu();
+        self.needs_redraw = true;
+        self.request_redraw();
+    }
+
+    /// Extended key actions for split panes, scroll, and fullscreen.
+    pub fn handle_extended_key_action(
+        &mut self,
+        config: &Config,
+        action: KeyAction,
+        event_loop: &ActiveEventLoop,
+    ) {
+        match action {
+            KeyAction::ScrollPageUp => self.scroll_terminal_page_up(),
+            KeyAction::ScrollPageDown => self.scroll_terminal_page_down(),
+            KeyAction::JumpPromptPrev => self.jump_to_previous_prompt(),
+            KeyAction::JumpPromptNext => self.jump_to_next_prompt(),
+            KeyAction::ToggleFullscreen => self.toggle_fullscreen(),
+            KeyAction::SplitVertical => {
+                self.split_focused_pane(config, SplitDirection::Horizontal, event_loop)
+            }
+            KeyAction::SplitHorizontal => {
+                self.split_focused_pane(config, SplitDirection::Vertical, event_loop)
+            }
+            KeyAction::ClosePane => self.close_focused_pane(config, event_loop),
+            KeyAction::FocusPaneLeft => self.focus_adjacent_pane(-1, 0, config),
+            KeyAction::FocusPaneRight => self.focus_adjacent_pane(1, 0, config),
+            KeyAction::FocusPaneUp => self.focus_adjacent_pane(0, -1, config),
+            KeyAction::FocusPaneDown => self.focus_adjacent_pane(0, 1, config),
+            _ => {}
+        }
+    }
+
+    fn split_focused_pane(
+        &mut self,
+        config: &Config,
+        direction: SplitDirection,
+        event_loop: &ActiveEventLoop,
+    ) {
+        if self.view_mode == ViewMode::Grid {
+            return;
+        }
+        let slot = self.focused_pane_slot();
+        let Some(pane) = self.panes.get(slot).copied() else {
+            return;
+        };
+        let cwd = self
+            .tabs
+            .tab_at_index(pane.tab_index)
+            .and_then(|tab| tab.leaf_session(pane.leaf_id))
+            .and_then(|s| s.current_working_directory());
+        let tab_id = self.tabs.tab_at_index(pane.tab_index).map(|t| t.id);
+        let Some(tab_id) = tab_id else {
+            return;
+        };
+        match spawn_leaf_session(
+            config,
+            tab_id,
+            pane.leaf_id + 1,
+            pane.layout,
+            &self.proxy_factory,
+            cwd,
+        ) {
+            Ok(session) => {
+                if let Some(tab) = self.tabs.tab_at_index_mut(pane.tab_index) {
+                    if let Some(new_id) = tab.root.split_leaf(pane.leaf_id, direction, session) {
+                        tab.focused_leaf = new_id;
+                    }
+                }
+                self.sync_terminal_layout(config, event_loop);
+            }
+            Err(error) => tracing::error!(%error, "failed to spawn split pane"),
+        }
+    }
+
+    fn close_focused_pane(&mut self, config: &Config, event_loop: &ActiveEventLoop) {
+        if self.view_mode == ViewMode::Grid {
+            return;
+        }
+        let slot = self.focused_pane_slot();
+        let Some(pane) = self.panes.get(slot).copied() else {
+            return;
+        };
+        if let Some(tab) = self.tabs.tab_at_index(pane.tab_index) {
+            if tab.leaf_count() <= 1 {
+                if let Some(id) = self.tabs.tab_at_index(pane.tab_index).map(|t| t.id) {
+                    let empty = self.close_tab(id, config, event_loop);
+                    if empty {
+                        return;
+                    }
+                }
+            } else if let Some(tab) = self.tabs.tab_at_index_mut(pane.tab_index) {
+                tab.root.remove_leaf(pane.leaf_id);
+                tab.focused_leaf = tab.focused_leaf.min(tab.leaf_count().saturating_sub(1));
+            }
+        }
+        self.sync_terminal_layout(config, event_loop);
+    }
+
+    fn focus_adjacent_pane(&mut self, dx: i32, dy: i32, config: &Config) {
+        let current = self.focused_pane_slot();
+        let Some(current_pane) = self.panes.get(current) else {
+            return;
+        };
+        let cur_bounds = current_pane.layout.pixel_bounds();
+        let cur_cx = (cur_bounds.x0 + cur_bounds.x1) * 0.5;
+        let cur_cy = (cur_bounds.y0 + cur_bounds.y1) * 0.5;
+        let mut best: Option<(usize, f32)> = None;
+        for (index, pane) in self.panes.iter().enumerate() {
+            if index == current {
+                continue;
+            }
+            let b = pane.layout.pixel_bounds();
+            let cx = (b.x0 + b.x1) * 0.5;
+            let cy = (b.y0 + b.y1) * 0.5;
+            let ok = match (dx, dy) {
+                (1, 0) => cx > cur_cx,
+                (-1, 0) => cx < cur_cx,
+                (0, 1) => cy > cur_cy,
+                (0, -1) => cy < cur_cy,
+                _ => false,
+            };
+            if !ok {
+                continue;
+            }
+            let dist = (cx - cur_cx).powi(2) + (cy - cur_cy).powi(2);
+            if best.map(|(_, d)| dist < d).unwrap_or(true) {
+                best = Some((index, dist));
+            }
+        }
+        if let Some((slot, _)) = best {
+            self.focus_pane_slot(slot, config);
+        }
+    }
+
+    pub fn scroll_terminal_page_up(&mut self) {
+        let slot = self.focused_pane_slot();
+        if let Some(pane) = self.panes.get(slot) {
+            if let Some(tab) = self.tabs.tab_at_index(pane.tab_index) {
+                if let Some(session) = tab.leaf_session(pane.leaf_id) {
+                    let mut term = session.terminal.lock();
+                    term.scroll_display(Scroll::PageUp);
+                }
+            }
+        }
+        self.invalidate_terminal_capture();
+        self.needs_redraw = true;
+        self.request_redraw();
+    }
+
+    pub fn scroll_terminal_page_down(&mut self) {
+        let slot = self.focused_pane_slot();
+        if let Some(pane) = self.panes.get(slot) {
+            if let Some(tab) = self.tabs.tab_at_index(pane.tab_index) {
+                if let Some(session) = tab.leaf_session(pane.leaf_id) {
+                    let mut term = session.terminal.lock();
+                    term.scroll_display(Scroll::PageDown);
+                }
+            }
+        }
+        self.invalidate_terminal_capture();
+        self.needs_redraw = true;
+        self.request_redraw();
+    }
+
+    pub fn jump_to_previous_prompt(&mut self) {
+        self.jump_to_prompt(false);
+    }
+
+    pub fn jump_to_next_prompt(&mut self) {
+        self.jump_to_prompt(true);
+    }
+
+    fn jump_to_prompt(&mut self, forward: bool) {
+        let slot = self.focused_pane_slot();
+        let Some(pane) = self.panes.get(slot) else {
+            return;
+        };
+        let col_count = pane.layout.cols as usize;
+        let Some(tab) = self.tabs.tab_at_index_mut(pane.tab_index) else {
+            return;
+        };
+        let Some(session) = tab.leaf_session_mut(pane.leaf_id) else {
+            return;
+        };
+        let mut term = session.terminal.lock();
+        let grid = term.grid();
+        let display_offset = grid.display_offset();
+        let viewport_top = Line(-(display_offset as i32));
+        let top = grid.topmost_line().0;
+        let bottom = grid.bottommost_line().0;
+        let lines: Vec<i32> = if forward {
+            ((viewport_top.0 + 1)..=bottom).collect()
+        } else {
+            (top..viewport_top.0).rev().collect()
+        };
+
+        let mut row_text = vec![' '; col_count];
+        for line in lines {
+            row_text.fill(' ');
+            for col in 0..col_count {
+                row_text[col] = grid[Point::new(Line(line), Column(col))].c;
+            }
+            let text: String = row_text.iter().collect();
+            if is_prompt_line(&text) {
+                scroll_to_grid_line(&mut term, Line(line));
+                break;
+            }
+        }
+        drop(term);
+        self.invalidate_terminal_capture();
+        self.needs_redraw = true;
+        self.request_redraw();
+    }
+
+    pub fn finish_tab_drag(&mut self, _x: f64, y: f64) {
+        let Some(id) = self.tab_drag_id.take() else {
+            return;
+        };
+        let layout = self.tab_strip_layout_snapshot();
+        if y < layout.list_top || y >= layout.list_bottom() {
+            return;
+        }
+        let content_y = (y - layout.list_top) + self.tab_scroll_offset;
+        let row_h = self.chrome_metrics.tab_strip.row_height();
+        if row_h <= 0.0 {
+            return;
+        }
+        let index = (content_y / row_h).floor() as usize;
+        if self.tabs.reorder_tab(id, index) {
+            self.mark_chrome_dirty();
+            self.needs_redraw = true;
+            self.request_redraw();
+        }
+    }
+
+    pub fn reset_cursor_blink_timer(&mut self) {
+        self.cursor_blink_visible = true;
+        self.cursor_blink_deadline = Some(Instant::now() + CURSOR_BLINK_INTERVAL);
+        self.blink_phase_changed = true;
+    }
+
+    pub fn tick_cursor_blink(&mut self) {
+        let Some(deadline) = self.cursor_blink_deadline else {
+            return;
+        };
+        if Instant::now() < deadline {
+            return;
+        }
+        self.cursor_blink_visible = !self.cursor_blink_visible;
+        self.cursor_blink_deadline = Some(Instant::now() + CURSOR_BLINK_INTERVAL);
+        self.blink_phase_changed = true;
+        self.needs_redraw = true;
+        self.request_redraw();
+    }
+
+    pub fn blink_wake_deadline(&self) -> Option<Instant> {
+        self.cursor_blink_deadline
+    }
+
+    pub fn ensure_blink_timer(&mut self) {
+        if self.cursor_blink_deadline.is_some() {
+            return;
+        }
+        if self.any_blink_animation_needed() {
+            self.reset_cursor_blink_timer();
+        }
+    }
+
+    fn any_blink_animation_needed(&self) -> bool {
+        for (slot, pane) in self.panes.iter().enumerate() {
+            if self
+                .pane_frames
+                .get(slot)
+                .is_some_and(frame_has_blink_cells)
+            {
+                return true;
+            }
+            let Some(tab) = self.tabs.tab_at_index(pane.tab_index) else {
+                continue;
+            };
+            let Some(session) = tab.leaf_session(pane.leaf_id) else {
+                continue;
+            };
+            let term = session.terminal.lock();
+            if term.cursor_style().blinking {
+                return true;
+            }
+        }
+        false
+    }
+
+    pub fn cursor_should_draw(&self, session: &PtySession) -> bool {
+        let term = session.terminal.lock();
+        if !term.mode().contains(TermMode::SHOW_CURSOR) {
+            return false;
+        }
+        if term.cursor_style().blinking {
+            self.cursor_blink_visible
+        } else {
+            true
+        }
+    }
+
+    pub fn duplicate_tab(
+        &mut self,
+        config: &Config,
+        next_tab_id: &mut usize,
+        event_loop: &ActiveEventLoop,
+    ) {
+        let (title, snapshot, reported_cwd) = {
+            let Some(tab) = self.tabs.active_tab() else {
+                return;
+            };
+            let Some(session) = tab.focused_session() else {
+                return;
+            };
+            let term = session.terminal.lock();
+            let lines = crate::terminal_clone::capture_grid_lines(&term);
+            let cwd = session.reported_cwd_handle().lock().clone();
+            (format!("{} (copy)", tab.title), lines, cwd)
+        };
+
+        self.spawn_tab(config, next_tab_id, event_loop);
+
+        if let Some(id) = self.tabs.active_id() {
+            if let Some(tab) = self.tabs.tab_by_id_mut(id) {
+                if let Some(session) = tab.focused_session_mut() {
+                    if let Some(cwd) = reported_cwd {
+                        *session.reported_cwd_handle().lock() = Some(cwd);
+                    }
+                    let mut term = session.terminal.lock();
+                    crate::terminal_clone::replay_grid_lines(&mut term, &snapshot);
+                }
+            }
+            self.tabs.set_title(id, title);
+            self.update_window_title(config);
+            self.mark_chrome_dirty();
+            self.request_full_capture();
+            self.needs_redraw = true;
+            self.request_redraw();
+        }
+    }
+
+    pub fn apply_config_reload(&mut self, config: &Config) {
+        for tab in self.tabs.iter_mut() {
+            for leaf in 0..tab.leaf_count() {
+                if let Some(session) = tab.leaf_session_mut(leaf) {
+                    let mut term = session.terminal.lock();
+                    crate::terminal_setup::apply_config_to_term(config, &mut term);
+                }
+            }
+        }
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.invalidate_text_cache();
+            renderer.set_config(config.clone());
+        }
+        self.mark_chrome_dirty();
+        self.request_full_capture();
+        self.needs_redraw = true;
+        self.request_redraw();
+        if config.window.always_on_top {
+            self.window
+                .set_window_level(winit::window::WindowLevel::AlwaysOnTop);
+        } else {
+            self.window
+                .set_window_level(winit::window::WindowLevel::Normal);
+        }
+    }
+
+    pub fn toggle_always_on_top(&mut self, config: &mut Config) {
+        config.window.always_on_top = !config.window.always_on_top;
+        self.apply_config_reload(config);
+    }
+
+    pub fn toggle_tab_pin(&mut self, id: TabId) {
+        self.tabs.toggle_pin(id);
+        self.mark_chrome_dirty();
+        self.needs_redraw = true;
+        self.request_redraw();
+    }
+
+    pub fn cycle_tab_color(&mut self, id: TabId) {
+        self.tabs.cycle_tab_color(id);
+        self.mark_chrome_dirty();
+        self.needs_redraw = true;
+        self.request_redraw();
+    }
+
+    pub fn toggle_fullscreen(&mut self) {
+        use winit::window::Fullscreen;
+        let entering = self.window.fullscreen().is_none();
+        if entering {
+            self.window
+                .set_fullscreen(Some(Fullscreen::Borderless(None)));
+        } else {
+            self.window.set_fullscreen(None);
+        }
+        self.needs_redraw = true;
+        self.request_redraw();
+    }
+
     pub fn redraw(&mut self, config: &Config, theme_mode: ThemeMode) {
+        self.tick_cursor_blink();
         let frame_start = Instant::now();
         self.ensure_renderer(config);
 
         if self.menu_open {
-            self.refresh_menu_entries(theme_mode);
+            self.refresh_menu_entries(config, theme_mode);
         }
 
         let chrome_changed = self.chrome_dirty;
@@ -1878,7 +3107,10 @@ impl WindowState {
         let mut dirty_rows = 0;
         let search_query = (self.search.active && !self.search.query.is_empty())
             .then(|| self.search.query.clone());
-        let mut search_match_count = 0;
+        if search_query.is_some() {
+            self.refresh_search_global_matches();
+        }
+        let search_match_count = self.search.match_count;
 
         for (slot, pane) in self.panes.iter().enumerate() {
             let Some(tab) = self.tabs.tab_at_index(pane.tab_index) else {
@@ -1887,7 +3119,10 @@ impl WindowState {
             let row_count = pane.layout.rows as usize;
             let col_count = pane.layout.cols as usize;
             let damage = {
-                let mut term = tab.session.terminal.lock();
+                let Some(session) = tab.leaf_session(pane.leaf_id) else {
+                    continue;
+                };
+                let mut term = session.terminal.lock();
                 capture_terminal_frame(
                     &mut self.pane_frame_bufs[slot],
                     &mut self.pane_row_scratch[slot],
@@ -1908,27 +3143,36 @@ impl WindowState {
                 }
                 FrameDamage::None => {}
             }
-            if let Some(query) = search_query.as_deref() {
-                search_match_count +=
-                    populate_search_matches(&mut self.pane_frames[slot], query, col_count);
-            } else {
-                self.pane_frames[slot].search_matches.clear();
-            }
-
             let active_match =
                 if slot == focused_pane && self.search.active && search_match_count > 0 {
-                    Some(
-                        self.search
-                            .current_match
-                            .min(search_match_count.saturating_sub(1)),
+                    let display_offset = self.pane_frames[slot].display_offset;
+                    populate_search_matches_from_global(
+                        &mut self.pane_frames[slot],
+                        &self.search.global_matches,
+                        self.search.current_match,
+                        display_offset,
+                        row_count,
+                        col_count,
                     )
                 } else {
+                    self.pane_frames[slot].search_matches.clear();
                     None
                 };
             self.pane_frames[slot].search_active_match = active_match;
+            if let Some(session) = tab.leaf_session(pane.leaf_id) {
+                self.pane_frames[slot].cursor_visible = self.cursor_should_draw(session);
+            }
+            self.pane_frames[slot].text_blink_visible = self.cursor_blink_visible;
+            if self.blink_phase_changed {
+                self.pane_damage[slot] = merge_blink_damage(
+                    std::mem::take(&mut self.pane_damage[slot]),
+                    &self.pane_frames[slot],
+                    col_count,
+                );
+            }
 
             if slot == focused_pane && self.modifiers.control_key() {
-                populate_link_hover(
+                frame_link_hover_at_cursor(
                     &mut self.pane_frames[slot],
                     pane.layout.cols as usize,
                     self.cursor_position.0,
@@ -1949,9 +3193,13 @@ impl WindowState {
             self.search.current_match = 0;
         }
         let capture_elapsed = capture_start.elapsed();
+        self.ensure_blink_timer();
+        let blink_phase_changed = self.blink_phase_changed;
+        self.blink_phase_changed = false;
 
-        let terminal_changed =
-            force_full || self.pane_damage.iter().any(|damage| !damage.is_unchanged());
+        let terminal_changed = force_full
+            || blink_phase_changed
+            || self.pane_damage.iter().any(|damage| !damage.is_unchanged());
         let bell_active = self.bell_flash_active();
         let link_hover_active = self.modifiers.control_key()
             && self.is_in_terminal(self.cursor_position.0, self.cursor_position.1);
@@ -1983,6 +3231,7 @@ impl WindowState {
             return;
         }
 
+        let ime_preedit = (!self.ime_preedit.is_empty()).then(|| self.ime_preedit.as_str());
         let pane_renders: Vec<PaneRender<'_>> = self
             .panes
             .iter()
@@ -1992,6 +3241,7 @@ impl WindowState {
                     frame,
                     layout: pane.layout,
                     damage: &self.pane_damage[slot],
+                    ime_preedit: (slot == focused_pane).then_some(ime_preedit).flatten(),
                 })
             })
             .collect();
@@ -2003,36 +3253,53 @@ impl WindowState {
                 self.search.query.clone(),
                 self.search.match_count,
                 self.search.current_match,
+                self.search.case_sensitive,
+                self.search.use_regex,
+                self.search.whole_word,
+                self.search.regex_error,
             )
         });
         let rename_overlay_snapshot = self.rename.active.then(|| self.rename.draft.clone());
         let command_palette_snapshot = self.command_palette.active.then(|| {
             (
                 self.command_palette.query.clone(),
-                self.command_palette_labels(),
+                self.command_palette_labels(config),
+                self.command_palette.selected_index,
             )
         });
         let Some(renderer) = self.renderer.as_mut() else {
             return;
         };
         let render_start = Instant::now();
-        let search_overlay =
-            search_overlay_snapshot
-                .as_ref()
-                .map(|(query, match_count, current_match)| SearchOverlayFrame {
-                    query,
-                    match_count: *match_count,
-                    current_match: *current_match,
-                });
+        let search_overlay = search_overlay_snapshot.as_ref().map(
+            |(
+                query,
+                match_count,
+                current_match,
+                case_sensitive,
+                use_regex,
+                whole_word,
+                regex_error,
+            )| SearchOverlayFrame {
+                query,
+                match_count: *match_count,
+                current_match: *current_match,
+                case_sensitive: *case_sensitive,
+                use_regex: *use_regex,
+                whole_word: *whole_word,
+                regex_error: *regex_error,
+            },
+        );
         let rename_overlay = rename_overlay_snapshot
             .as_ref()
             .map(|draft| RenameOverlayFrame { draft });
         let command_palette =
             command_palette_snapshot
                 .as_ref()
-                .map(|(query, entries)| CommandPaletteFrame {
+                .map(|(query, entries, selected_index)| CommandPaletteFrame {
                     query,
                     entries: entries.as_slice(),
+                    selected_index: *selected_index,
                 });
         match renderer.render(
             &pane_renders,
@@ -2066,12 +3333,25 @@ impl WindowState {
                     dirty_rows,
                     false,
                 );
+                if timings.presented {
+                    self.needs_redraw = false;
+                } else {
+                    // The surface was occluded/outdated and the frame was
+                    // dropped (e.g. another window covered ours). Keep the dirty
+                    // flag and force a full recapture so the next paint restores
+                    // the real content instead of leaving stale output. We do
+                    // not call `request_redraw` here: the idle poll retries at a
+                    // bounded rate, avoiding a tight repaint loop while hidden.
+                    self.force_full_capture = true;
+                    self.needs_redraw = true;
+                }
             }
-            Err(error) => tracing::error!(%error, "render failed"),
+            Err(error) => {
+                tracing::error!(%error, "render failed");
+                self.needs_redraw = false;
+            }
         }
         self.bell_flash_was_active = bell_active;
-
-        self.needs_redraw = false;
     }
 
     pub fn invalidate_terminal_capture(&mut self) {
@@ -2104,6 +3384,15 @@ impl WindowState {
         config.ui.sidebar_width = self.sidebar_width;
         config.ui.sidebar_collapsed = self.sidebar_collapsed;
         config.ui.view_mode = self.view_mode.into();
+        config.ui.follow_output = self.follow_output;
+        let scale = self.window.scale_factor();
+        let size = self.window.inner_size();
+        config.window.width = size.width as f64 / scale;
+        config.window.height = size.height as f64 / scale;
+        if let Ok(pos) = self.window.outer_position() {
+            config.window.x = Some(pos.x);
+            config.window.y = Some(pos.y);
+        }
         config.session.cwd = self
             .tabs
             .infos()
@@ -2129,6 +3418,75 @@ enum PaletteItem {
         id: TabId,
         title: String,
     },
+    Profile {
+        name: String,
+    },
+}
+
+fn fuzzy_score(query: &str, label: &str) -> Option<i32> {
+    if query.is_empty() {
+        return Some(0);
+    }
+    let q: Vec<char> = query.chars().collect();
+    let l: Vec<char> = label.to_ascii_lowercase().chars().collect();
+    let mut qi = 0usize;
+    let mut score = 0i32;
+    let mut prev = 0usize;
+    for (i, ch) in l.iter().enumerate() {
+        if qi < q.len() && *ch == q[qi] {
+            if qi > 0 {
+                score += 10 - (i - prev).min(9) as i32;
+            } else {
+                score += 10 - i.min(9) as i32;
+            }
+            prev = i;
+            qi += 1;
+        }
+    }
+    (qi == q.len()).then_some(score)
+}
+
+fn menu_action_key_hint(action: MenuAction, bindings: &KeybindingsConfig) -> Option<String> {
+    menu_action_to_key_action(action)
+        .and_then(|key_action| bindings.chord_label_for_action(key_action))
+}
+
+fn menu_action_to_key_action(action: MenuAction) -> Option<KeyAction> {
+    match action {
+        MenuAction::NewTab => Some(KeyAction::NewTab),
+        MenuAction::DuplicateTab => Some(KeyAction::DuplicateTab),
+        MenuAction::CloseTab => Some(KeyAction::CloseTab),
+        MenuAction::DetachTab => Some(KeyAction::DetachTab),
+        MenuAction::RenameTab => Some(KeyAction::RenameTab),
+        MenuAction::Copy => Some(KeyAction::Copy),
+        MenuAction::Paste => Some(KeyAction::Paste),
+        MenuAction::ClearScrollback => Some(KeyAction::ClearScrollback),
+        MenuAction::ZoomIn => Some(KeyAction::ZoomIn),
+        MenuAction::ZoomOut => Some(KeyAction::ZoomOut),
+        MenuAction::ZoomReset => Some(KeyAction::ZoomReset),
+        MenuAction::ToggleFullscreen => Some(KeyAction::ToggleFullscreen),
+        MenuAction::ToggleFollowOutput => Some(KeyAction::ScrollPageDown),
+        MenuAction::TogglePerfOverlay => Some(KeyAction::OpenCommandPalette),
+        MenuAction::ViewSingle | MenuAction::ViewGrid => Some(KeyAction::OpenCommandPalette),
+        MenuAction::ThemeLight | MenuAction::ThemeDark | MenuAction::ThemeAuto => {
+            Some(KeyAction::OpenCommandPalette)
+        }
+        MenuAction::ToggleTabPin | MenuAction::CycleTabColor | MenuAction::ToggleAlwaysOnTop => {
+            None
+        }
+        MenuAction::Quit => Some(KeyAction::CloseTab),
+    }
+}
+
+fn is_prompt_line(text: &str) -> bool {
+    let trimmed = text.trim_end();
+    if trimmed.is_empty() {
+        return false;
+    }
+    trimmed.ends_with(['$', '#', '%', '❯', '➜', 'λ', '»'])
+        || trimmed.ends_with('>')
+        || trimmed.contains("$ ")
+        || trimmed.contains("# ")
 }
 
 fn palette_commands() -> Vec<PaletteCommand> {
@@ -2166,6 +3524,10 @@ fn palette_commands() -> Vec<PaletteCommand> {
             action: MenuAction::ClearScrollback,
         },
         PaletteCommand {
+            label: "Toggle Scroll on Output",
+            action: MenuAction::ToggleFollowOutput,
+        },
+        PaletteCommand {
             label: "Single Terminal View",
             action: MenuAction::ViewSingle,
         },
@@ -2176,6 +3538,10 @@ fn palette_commands() -> Vec<PaletteCommand> {
         PaletteCommand {
             label: "Toggle Perf Overlay",
             action: MenuAction::TogglePerfOverlay,
+        },
+        PaletteCommand {
+            label: "Toggle Fullscreen",
+            action: MenuAction::ToggleFullscreen,
         },
         PaletteCommand {
             label: "Theme Light",
@@ -2200,6 +3566,18 @@ fn palette_commands() -> Vec<PaletteCommand> {
         PaletteCommand {
             label: "Reset Zoom",
             action: MenuAction::ZoomReset,
+        },
+        PaletteCommand {
+            label: "Pin / Unpin Tab",
+            action: MenuAction::ToggleTabPin,
+        },
+        PaletteCommand {
+            label: "Set Tab Color",
+            action: MenuAction::CycleTabColor,
+        },
+        PaletteCommand {
+            label: "Always on Top",
+            action: MenuAction::ToggleAlwaysOnTop,
         },
         PaletteCommand {
             label: "Quit",
@@ -2229,52 +3607,7 @@ fn short_path(path: &std::path::Path) -> String {
     }
 }
 
-fn url_span_in_row(
-    cells: &[(Point, Cell)],
-    col_count: usize,
-    target_col: usize,
-) -> Option<SearchMatch> {
-    let mut chars = vec![' '; col_count];
-    for (point, cell) in cells {
-        let col = point.column.0;
-        if col < col_count {
-            chars[col] = cell.c;
-        }
-    }
-
-    let row: String = chars.iter().collect();
-    for scheme in ["https://", "http://", "file://"] {
-        let mut search_from = 0;
-        while let Some(offset) = row[search_from..].find(scheme) {
-            let start = search_from + offset;
-            let rest = &row[start..];
-            let raw_len = rest
-                .char_indices()
-                .find(|(_, ch)| ch.is_whitespace())
-                .map(|(idx, _)| idx)
-                .unwrap_or(rest.len());
-            let raw = &rest[..raw_len];
-            let trimmed = raw.trim_end_matches(['.', ',', ')', ']']);
-            let start_col = row[..start].chars().count();
-            let end_col = start_col + trimmed.chars().count();
-            if target_col >= start_col && target_col < end_col {
-                return Some(SearchMatch {
-                    row: 0,
-                    start_col,
-                    end_col,
-                });
-            }
-            search_from = start + raw_len.max(1);
-            if search_from >= row.len() {
-                break;
-            }
-        }
-    }
-
-    None
-}
-
-fn populate_link_hover(
+fn frame_link_hover_at_cursor(
     frame: &mut TerminalFrame,
     col_count: usize,
     x: f64,
@@ -2292,88 +3625,153 @@ fn populate_link_hover(
         .floor()
         .max(0.0) as usize;
 
-    let Some(cells) = frame.rows.get(row) else {
+    if frame.rows.get(row).is_none() {
+        return;
+    }
+    let Some(link) = links::detect_link_at(&frame.rows, col_count, row, col) else {
         return;
     };
-    let Some(mut span) = url_span_in_row(cells, col_count, col) else {
-        return;
-    };
-    span.row = row;
-    frame.link_hovers.push(span);
+    frame.link_hovers.extend(link.spans);
 }
 
-fn url_in_row(cells: &[(Point, Cell)], col_count: usize, target_col: usize) -> Option<String> {
-    let mut chars = vec![' '; col_count];
-    for (point, cell) in cells {
-        let col = point.column.0;
-        if col < col_count {
-            chars[col] = cell.c;
-        }
-    }
-
-    let row: String = chars.iter().collect();
-    for scheme in ["https://", "http://", "file://"] {
-        let mut search_from = 0;
-        while let Some(offset) = row[search_from..].find(scheme) {
-            let start = search_from + offset;
-            let rest = &row[start..];
-            let raw_len = rest
-                .char_indices()
-                .find(|(_, ch)| ch.is_whitespace())
-                .map(|(idx, _)| idx)
-                .unwrap_or(rest.len());
-            let raw = &rest[..raw_len];
-            let trimmed = raw.trim_end_matches(['.', ',', ')', ']']);
-            let start_col = row[..start].chars().count();
-            let end_col = start_col + trimmed.chars().count();
-            if target_col >= start_col && target_col < end_col {
-                return Some(trimmed.to_owned());
-            }
-            search_from = start + raw_len.max(1);
-            if search_from >= row.len() {
-                break;
-            }
-        }
-    }
-
-    None
-}
-
-fn populate_search_matches(frame: &mut TerminalFrame, query: &str, col_count: usize) -> usize {
-    frame.search_matches.clear();
+fn search_scrollback<T: EventListener>(
+    term: &Term<T>,
+    query: &str,
+    col_count: usize,
+    case_sensitive: bool,
+    use_regex: bool,
+    whole_word: bool,
+    regex_error: &mut bool,
+) -> Vec<GlobalSearchMatch> {
+    *regex_error = false;
     if query.is_empty() || col_count == 0 {
-        return 0;
+        return Vec::new();
     }
 
-    let query_chars: Vec<char> = query.chars().map(|ch| ch.to_ascii_lowercase()).collect();
-    if query_chars.is_empty() {
-        return 0;
-    }
-
+    let grid = term.grid();
+    let top = grid.topmost_line().0;
+    let bottom = grid.bottommost_line().0;
+    let mut matches = Vec::new();
     let mut row_text = vec![' '; col_count];
-    for (row, cells) in frame.rows.iter().enumerate() {
-        row_text.fill(' ');
-        for (point, cell) in cells {
-            let col = point.column.0;
-            if col < col_count {
-                row_text[col] = cell.c.to_ascii_lowercase();
+
+    if use_regex {
+        let pattern = if whole_word {
+            format!(r"\b{query}\b")
+        } else {
+            query.to_owned()
+        };
+        let mut builder = regex::RegexBuilder::new(&pattern);
+        if !case_sensitive {
+            builder.case_insensitive(true);
+        }
+        let Ok(re) = builder.build() else {
+            *regex_error = true;
+            return Vec::new();
+        };
+
+        for line in top..=bottom {
+            row_text.fill(' ');
+            for col in 0..col_count {
+                row_text[col] = grid[Point::new(Line(line), Column(col))].c;
             }
-        }
-
-        if query_chars.len() > row_text.len() {
-            continue;
-        }
-
-        for start in 0..=row_text.len() - query_chars.len() {
-            if row_text[start..start + query_chars.len()] == query_chars {
-                frame.search_matches.push(SearchMatch {
-                    row,
-                    start_col: start,
-                    end_col: start + query_chars.len(),
+            let line_str: String = row_text.iter().collect();
+            for m in re.find_iter(&line_str) {
+                matches.push(GlobalSearchMatch {
+                    grid_line: line,
+                    start_col: m.start(),
+                    end_col: m.end(),
                 });
             }
         }
+        return matches;
     }
 
-    frame.search_matches.len()
+    let query_chars: Vec<char> = if case_sensitive {
+        query.chars().collect()
+    } else {
+        query.chars().map(|ch| ch.to_ascii_lowercase()).collect()
+    };
+
+    for line in top..=bottom {
+        row_text.fill(' ');
+        for col in 0..col_count {
+            let cell = &grid[Point::new(Line(line), Column(col))];
+            row_text[col] = if case_sensitive {
+                cell.c
+            } else {
+                cell.c.to_ascii_lowercase()
+            };
+        }
+        if query_chars.len() > row_text.len() {
+            continue;
+        }
+        for start in 0..=row_text.len() - query_chars.len() {
+            if row_text[start..start + query_chars.len()] != query_chars {
+                continue;
+            }
+            if whole_word && !word_boundary_match(&row_text, start, query_chars.len()) {
+                continue;
+            }
+            matches.push(GlobalSearchMatch {
+                grid_line: line,
+                start_col: start,
+                end_col: start + query_chars.len(),
+            });
+        }
+    }
+    matches
+}
+
+fn word_boundary_match(row: &[char], start: usize, len: usize) -> bool {
+    let is_word = |ch: char| ch.is_alphanumeric() || ch == '_';
+    let before_ok = start == 0 || !is_word(row[start - 1]);
+    let end = start + len;
+    let after_ok = end >= row.len() || !is_word(row[end]);
+    before_ok && after_ok
+}
+
+fn scroll_to_grid_line<T: EventListener>(term: &mut Term<T>, line: Line) {
+    let grid = term.grid();
+    let display_offset = grid.display_offset() as i32;
+    let viewport_top = Line(-display_offset);
+    let viewport_bottom = Line(viewport_top.0 + grid.screen_lines() as i32 - 1);
+    if line < viewport_top {
+        let delta: i32 = viewport_top.0 - line.0;
+        term.scroll_display(Scroll::Delta(-delta));
+    } else if line > viewport_bottom {
+        let delta: i32 = line.0 - viewport_bottom.0;
+        term.scroll_display(Scroll::Delta(delta));
+    }
+}
+
+fn populate_search_matches_from_global(
+    frame: &mut TerminalFrame,
+    matches: &[GlobalSearchMatch],
+    current_match: usize,
+    display_offset: usize,
+    row_count: usize,
+    col_count: usize,
+) -> Option<usize> {
+    frame.search_matches.clear();
+    let mut active_viewport = None;
+    for (index, m) in matches.iter().enumerate() {
+        let line = Line(m.grid_line);
+        let Some(viewport) = point_to_viewport(display_offset, Point::new(line, Column(0))) else {
+            continue;
+        };
+        let row = viewport.line;
+        if row >= row_count {
+            continue;
+        }
+        let match_index = frame.search_matches.len();
+        frame.search_matches.push(SearchMatch {
+            row,
+            start_col: m.start_col.min(col_count),
+            end_col: m.end_col.min(col_count),
+        });
+        if index == current_match {
+            active_viewport = Some(match_index);
+        }
+    }
+    active_viewport
 }

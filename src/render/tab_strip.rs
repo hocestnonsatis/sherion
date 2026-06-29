@@ -2,6 +2,7 @@ use std::ops::Range;
 use std::time::Duration;
 
 use vello::kurbo::{Affine, Rect, RoundedRect, RoundedRectRadii};
+use vello::peniko::color::AlphaColor;
 use vello::peniko::{Brush, Fill};
 use vello::Scene;
 
@@ -384,6 +385,16 @@ impl TabStripRenderer {
             );
             scene.fill(Fill::NonZero, Affine::IDENTITY, tab_bg, None, &rect);
 
+            if let Some([r, g, b]) = entry.accent {
+                scene.fill(
+                    Fill::NonZero,
+                    Affine::IDENTITY,
+                    &Brush::Solid(AlphaColor::from_rgb8(r, g, b)),
+                    None,
+                    &Rect::new(inset, draw_top + inset, inset + 3.0, draw_bottom - inset),
+                );
+            }
+
             if entry.active {
                 scene.fill(
                     Fill::NonZero,
@@ -453,7 +464,14 @@ impl TabStripRenderer {
             }
 
             let max_chars = (f64::from(text_max_width) / glyph_advance.max(1.0)).max(3.0) as usize;
-            let label = truncate_title(&entry.title, max_chars);
+            let label = if entry.pinned {
+                format!(
+                    "📌 {}",
+                    truncate_title(&entry.title, max_chars.saturating_sub(2))
+                )
+            } else {
+                truncate_title(&entry.title, max_chars)
+            };
 
             draw_text(
                 layout_cx,

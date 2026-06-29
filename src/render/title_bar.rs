@@ -26,6 +26,8 @@ impl TitleBarMetrics {
 pub enum TitleBarHit {
     Drag,
     Hamburger,
+    Minimize,
+    Maximize,
     Close,
     None,
 }
@@ -35,6 +37,8 @@ pub struct TitleBarLayout {
     pub x_offset: f64,
     pub drag_region: Range<f64>,
     pub hamburger_region: Range<f64>,
+    pub minimize_region: Range<f64>,
+    pub maximize_region: Range<f64>,
     pub close_region: Range<f64>,
     pub width: f64,
 }
@@ -42,13 +46,17 @@ pub struct TitleBarLayout {
 impl TitleBarLayout {
     pub fn compute(metrics: TitleBarMetrics, x_offset: f64, width: f64) -> Self {
         let close_start = (width - WINDOW_BUTTON_WIDTH).max(0.0);
-        let hamburger_start = (close_start - WINDOW_BUTTON_WIDTH).max(0.0);
+        let maximize_start = (close_start - WINDOW_BUTTON_WIDTH).max(0.0);
+        let minimize_start = (maximize_start - WINDOW_BUTTON_WIDTH).max(0.0);
+        let hamburger_start = (minimize_start - WINDOW_BUTTON_WIDTH).max(0.0);
 
         Self {
             metrics,
             x_offset,
             drag_region: 0.0..hamburger_start,
-            hamburger_region: hamburger_start..close_start,
+            hamburger_region: hamburger_start..minimize_start,
+            minimize_region: minimize_start..maximize_start,
+            maximize_region: maximize_start..close_start,
             close_region: close_start..width,
             width,
         }
@@ -64,6 +72,12 @@ impl TitleBarLayout {
         }
         if self.close_region.contains(&local_x) {
             return TitleBarHit::Close;
+        }
+        if self.maximize_region.contains(&local_x) {
+            return TitleBarHit::Maximize;
+        }
+        if self.minimize_region.contains(&local_x) {
+            return TitleBarHit::Minimize;
         }
         if self.hamburger_region.contains(&local_x) {
             return TitleBarHit::Hamburger;
@@ -143,6 +157,26 @@ impl TitleBarRenderer {
 
         self.draw_window_button(
             scene,
+            layout.x_offset + layout.minimize_region.start,
+            layout.x_offset + layout.minimize_region.end,
+            height,
+            &hover_bg,
+            ButtonKind::Minimize,
+            &fg,
+        );
+
+        self.draw_window_button(
+            scene,
+            layout.x_offset + layout.maximize_region.start,
+            layout.x_offset + layout.maximize_region.end,
+            height,
+            &hover_bg,
+            ButtonKind::Maximize,
+            &fg,
+        );
+
+        self.draw_window_button(
+            scene,
             layout.x_offset + layout.close_region.start,
             layout.x_offset + layout.close_region.end,
             height,
@@ -169,6 +203,8 @@ impl TitleBarRenderer {
         let cy = height * 0.5;
         match kind {
             ButtonKind::Hamburger => self.draw_hamburger(scene, cx, cy, icon),
+            ButtonKind::Minimize => self.draw_minimize(scene, cx, cy, icon),
+            ButtonKind::Maximize => self.draw_maximize(scene, cx, cy, icon),
             ButtonKind::Close => self.draw_close(scene, cx, cy, icon),
         }
     }
@@ -194,6 +230,41 @@ impl TitleBarRenderer {
         }
     }
 
+    fn draw_minimize(&self, scene: &mut Scene, cx: f64, cy: f64, brush: &Brush) {
+        let line_w = 10.0;
+        let line_h = 1.8;
+        scene.fill(
+            Fill::NonZero,
+            Affine::IDENTITY,
+            brush,
+            None,
+            &RoundedRect::new(
+                cx - line_w * 0.5,
+                cy + 4.0 - line_h * 0.5,
+                cx + line_w * 0.5,
+                cy + 4.0 + line_h * 0.5,
+                RoundedRectRadii::from_single_radius(1.0),
+            ),
+        );
+    }
+
+    fn draw_maximize(&self, scene: &mut Scene, cx: f64, cy: f64, brush: &Brush) {
+        let size = 9.0;
+        let stroke = Stroke::new(1.6);
+        scene.stroke(
+            &stroke,
+            Affine::IDENTITY,
+            brush,
+            None,
+            &Rect::new(
+                cx - size * 0.5,
+                cy - size * 0.5,
+                cx + size * 0.5,
+                cy + size * 0.5,
+            ),
+        );
+    }
+
     fn draw_close(&self, scene: &mut Scene, cx: f64, cy: f64, brush: &Brush) {
         let size = 5.5;
         let stroke = Stroke::new(1.8);
@@ -216,5 +287,7 @@ impl TitleBarRenderer {
 
 enum ButtonKind {
     Hamburger,
+    Minimize,
+    Maximize,
     Close,
 }

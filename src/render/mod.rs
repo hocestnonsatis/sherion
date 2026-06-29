@@ -1,3 +1,6 @@
+mod background;
+mod background_shader;
+mod atlas;
 mod chrome;
 pub mod frame;
 mod glyph_cache;
@@ -14,7 +17,10 @@ mod theme;
 mod title_bar;
 
 pub use chrome::ChromeMetrics;
-pub use layout::{grid_dims, pane_rects, ContentRect, TerminalLayout, MAX_GRID_PANES};
+pub use layout::{
+    grid_dims, pane_rects, split_dividers, split_tree_rects, ContentRect, SplitDividerHit,
+    SplitLayoutEntry, TerminalLayout, MAX_GRID_PANES,
+};
 pub use menu::{MenuAction, MenuEntry, MenuHit, MenuLayout};
 pub use perf::{PerfStatsSnapshot, RenderTimings};
 pub use renderer::{

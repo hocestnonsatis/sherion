@@ -9,6 +9,7 @@ pub enum UserEvent {
     Terminal {
         window_id: WindowId,
         tab_id: TabId,
+        leaf_id: usize,
         event: TerminalEvent,
     },
 }
@@ -19,14 +20,21 @@ pub struct EventProxy {
     #[allow(dead_code)]
     window_id: WindowId,
     tab_id: TabId,
+    leaf_id: usize,
 }
 
 impl EventProxy {
-    pub fn new(proxy: EventLoopProxy<UserEvent>, window_id: WindowId, tab_id: TabId) -> Self {
+    pub fn new(
+        proxy: EventLoopProxy<UserEvent>,
+        window_id: WindowId,
+        tab_id: TabId,
+        leaf_id: usize,
+    ) -> Self {
         Self {
             proxy,
             window_id,
             tab_id,
+            leaf_id,
         }
     }
 }
@@ -36,6 +44,7 @@ impl EventListener for EventProxy {
         let _ = self.proxy.send_event(UserEvent::Terminal {
             window_id: self.window_id,
             tab_id: self.tab_id,
+            leaf_id: self.leaf_id,
             event,
         });
     }

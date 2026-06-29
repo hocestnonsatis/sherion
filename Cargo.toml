@@ -3,8 +3,16 @@ name = "sherion"
 version = "0.1.0"
 edition = "2021"
 description = "A high-performance Rust terminal emulator"
+authors = ["hocestnonsatis"]
 license = "MIT"
+repository = "https://github.com/hocestnonsatis/sherion"
 rust-version = "1.88"
+
+[package.metadata.wix]
+upgrade-guid = "52179E66-3A8F-4DAC-BB89-FB7E7F0C0559"
+path-guid = "9DE1A4D9-5050-4F69-8354-7869C5338986"
+license = false
+eula = false
 
 [lib]
 name = "sherion"
@@ -16,6 +24,9 @@ path = "src/main.rs"
 
 [dependencies]
 alacritty_terminal = "0.26"
+vte = "0.15"
+swash = "0.2"
+fontdb = "0.23"
 arboard = "3"
 anyhow = "1"
 parking_lot = "0.12"
@@ -29,4 +40,37 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 vello = "0.9"
 wgpu = "29"
 winit = "0.30"
+regex = "1"
+notify = "6"
+polling = "3"
 libc = "0.2.186"
+image = "0.25"
+simdutf8 = { version = "0.1", optional = true }
+
+[features]
+default = []
+profiler = []
+simd-utf8 = ["dep:simdutf8"]
+
+[patch.crates-io]
+alacritty_terminal = { path = "vendor/alacritty_terminal" }
+
+# Config for 'dist'
+[workspace.metadata.dist]
+# Target platforms to build apps for (Rust target-triple syntax)
+targets = ["aarch64-apple-darwin", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
+# The installers to generate for each app
+installers = ["shell", "powershell", "msi"]
+# CI backends to support
+ci = "github"
+# The preferred dist version to use in CI (Cargo.toml SemVer syntax)
+cargo-dist-version = "0.32.0"
+# Path that installers should place binaries in
+install-path = "CARGO_HOME"
+# Whether to install an updater program
+install-updater = false
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"

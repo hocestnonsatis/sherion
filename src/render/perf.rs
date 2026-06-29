@@ -4,7 +4,12 @@ use std::time::Duration;
 pub struct RenderTimings {
     pub scene: Duration,
     pub gpu: Duration,
+    /// False when the surface texture could not be acquired (occluded/outdated)
+    /// and the frame was dropped, so the caller can schedule a retry.
+    pub presented: bool,
 }
+
+const FPS_HISTORY_LEN: usize = 60;
 
 #[derive(Clone, Copy, Debug)]
 pub struct PerfStatsSnapshot {
@@ -18,6 +23,8 @@ pub struct PerfStatsSnapshot {
     pub full_panes: usize,
     pub dirty_rows: usize,
     pub skipped_frames: u64,
+    pub fps_history: [f32; FPS_HISTORY_LEN],
+    pub fps_history_len: usize,
 }
 
 impl Default for PerfStatsSnapshot {
@@ -33,6 +40,8 @@ impl Default for PerfStatsSnapshot {
             full_panes: 0,
             dirty_rows: 0,
             skipped_frames: 0,
+            fps_history: [0.0; FPS_HISTORY_LEN],
+            fps_history_len: 0,
         }
     }
 }
@@ -63,6 +72,9 @@ impl PerfStatsSnapshot {
         } else {
             0.0
         };
+        let idx = self.fps_history_len % FPS_HISTORY_LEN;
+        self.fps_history[idx] = self.fps;
+        self.fps_history_len = self.fps_history_len.saturating_add(1);
         self.panes = panes;
         self.full_panes = full_panes;
         self.dirty_rows = dirty_rows;

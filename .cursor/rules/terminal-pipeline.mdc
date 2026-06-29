@@ -1,0 +1,50 @@
+---
+description: Terminal emulator architecture, threading, performance, and rendering rules
+alwaysApply: true
+---
+
+# Terminal Pipeline Rules
+
+## 1. Architecture and Threading
+
+- PTY read/write operations must be fully isolated from the UI (main event loop) thread.
+- The reader thread must perform **blocking reads** on the master PTY and forward data to the main thread via an **MPSC channel**.
+- Keyboard and mouse input must be read directly from the OS buffer and written to the PTY with highest priority, targeting **< 5 ms input latency**.
+
+```rust
+// ❌ BAD — blocking PTY read on the UI thread
+let n = pty.read(&mut buf)?;
+
+// ✅ GOOD — dedicated reader thread + MPSC
+std::thread::spawn(move || {
+    loop {
+        let n = pty.read(&mut buf).unwrap();
+        tx.send(buf[..n].to_vec()).unwrap();
+    }
+});
+```
+
+## 2. Performance and Memory
+
+- Avoid per-frame allocations in the render loop; reuse existing buffers.
+- Use a **circular ring buffer** (`VecDeque::with_capacity`) for scrollback to minimize data-copy cost.
+- In hot paths, avoid `sprintf`-style formatting; assemble a full frame in a single buffer and submit with **one `write()`** syscall.
+
+## 3. Windows / ConPTY
+
+- Before `ClosePseudoConsole`, the output pipe must be **drained** or its handle **closed** to prevent deadlocks.
+- `CreatePseudoConsole` flags:
+  - `PSEUDOCONSOLE_PASSTHROUGH_MODE` (0x8) — modern VT support
+  - `PSEUDOCONSOLE_WIN32_INPUT_MODE` (0x4) — correct keyboard handling
+
+## 4. Graphics and Rendering
+
+- **Dirty row tracking**: upload only changed rows to the GPU and draw only updated regions.
+- Use a **glyph atlas** (rasterized via swash or similar) instead of vector drawing every frame.
+- Lock presentation to **VSync**; keep data processing and render rates independent (adaptive).
+
+## 5. Parsing and Safety
+
+- Parse PTY byte streams with a table-driven state machine: **vte** (Alacritty) or **vtparse** (WezTerm).
+- Use **SIMD** libraries (e.g. simdutf8) for UTF-8 validation and processing at high throughput.
+- Handle split partial UTF-8 at stream boundaries with stateful parsers or `String::from_utf8_lossy` to avoid data loss.

@@ -1,11 +1,10 @@
 use std::collections::HashMap;
+use std::sync::mpsc::Receiver;
 use std::sync::Arc;
 
 use alacritty_terminal::event::Event as TerminalEvent;
 use alacritty_terminal::grid::Scroll;
-use alacritty_terminal::index::{Column, Point, Side};
-use alacritty_terminal::selection::{Selection, SelectionType};
-use alacritty_terminal::term::viewport_to_point;
+use alacritty_terminal::selection::SelectionType;
 use anyhow::Result;
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalPosition;
@@ -13,7 +12,7 @@ use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::window::{CursorIcon, Theme, Window, WindowId};
 
-use crate::config::{Config, ThemeMode};
+use crate::config::{Config, ThemeMode, WindowDecorations};
 use crate::event::UserEvent;
 use crate::input::key_event_to_action;
 use crate::render::MenuHit;
@@ -29,6 +28,7 @@ pub struct App {
     theme_mode: ThemeMode,
     next_tab_id: usize,
     windows: HashMap<WindowId, WindowState>,
+    config_reload_rx: Option<Receiver<()>>,
 }
 
 impl App {
@@ -44,11 +44,55 @@ impl App {
             theme_mode,
             next_tab_id: 0,
             windows: HashMap::new(),
+            config_reload_rx: Self::watch_config_file(),
         };
 
         event_loop.run_app(&mut app)?;
         let _ = terminal_opacity;
         Ok(())
+    }
+
+    fn watch_config_file() -> Option<Receiver<()>> {
+        use notify::{RecommendedWatcher, RecursiveMode, Watcher};
+        use std::sync::mpsc;
+
+        let (tx, rx) = mpsc::channel();
+        let path = crate::config::config_path();
+        let mut watcher = RecommendedWatcher::new(
+            move |_| {
+                let _ = tx.send(());
+            },
+            notify::Config::default(),
+        )
+        .ok()?;
+        if path.exists() {
+            let _ = watcher.watch(&path, RecursiveMode::NonRecursive);
+        }
+        std::mem::forget(watcher);
+        Some(rx)
+    }
+
+    fn reload_config_if_changed(&mut self) {
+        let Some(rx) = &self.config_reload_rx else {
+            return;
+        };
+        while rx.try_recv().is_ok() {
+            if let Ok(config) = Config::load_profile(self.config.active_profile.as_deref()) {
+                self.config = config;
+                for ws in self.windows.values_mut() {
+                    ws.apply_config_reload(&self.config);
+                }
+            }
+        }
+    }
+
+    pub fn switch_profile(&mut self, name: &str) {
+        if let Ok(config) = Config::load_profile(Some(name)) {
+            self.config = config;
+            for ws in self.windows.values_mut() {
+                ws.apply_config_reload(&self.config);
+            }
+        }
     }
 
     fn terminal_opacity(&self) -> f32 {
@@ -113,22 +157,50 @@ impl App {
         }
     }
 
+    fn window_inner_size(config: &Config) -> (u32, u32) {
+        let width = if config.window.width > 0.0 {
+            config.window.width.round() as u32
+        } else {
+            INITIAL_WIDTH
+        };
+        let height = if config.window.height > 0.0 {
+            config.window.height.round() as u32
+        } else {
+            INITIAL_HEIGHT
+        };
+        (width.max(200), height.max(150))
+    }
+
+    fn apply_window_position(window: &Window, config: &Config) {
+        if let (Some(x), Some(y)) = (config.window.x, config.window.y) {
+            window.set_outer_position(PhysicalPosition::new(x, y));
+        }
+    }
+
+    fn window_attributes(
+        &self,
+        title: &str,
+        width: u32,
+        height: u32,
+    ) -> winit::window::WindowAttributes {
+        let native = self.config.window.decorations == WindowDecorations::Native;
+        Window::default_attributes()
+            .with_title(title)
+            .with_decorations(native)
+            .with_transparent(!native)
+            .with_visible(true)
+            .with_inner_size(winit::dpi::LogicalSize::new(width, height))
+    }
+
     fn create_window(&mut self, event_loop: &ActiveEventLoop) {
+        let (width, height) = Self::window_inner_size(&self.config);
         let window = Arc::new(
             event_loop
-                .create_window(
-                    Window::default_attributes()
-                        .with_title(self.config.window.title.clone())
-                        .with_decorations(false)
-                        .with_transparent(true)
-                        .with_visible(true)
-                        .with_inner_size(winit::dpi::LogicalSize::new(
-                            INITIAL_WIDTH,
-                            INITIAL_HEIGHT,
-                        )),
-                )
+                .create_window(self.window_attributes(&self.config.window.title, width, height))
                 .expect("create window"),
         );
+
+        Self::apply_window_position(&window, &self.config);
 
         match self.theme_mode {
             ThemeMode::Light => window.set_theme(Some(Theme::Light)),
@@ -162,24 +234,17 @@ impl App {
         terminal_opacity: f32,
         outer_pos: Option<PhysicalPosition<i32>>,
     ) -> Option<WindowId> {
+        let (width, height) = Self::window_inner_size(&self.config);
         let window = Arc::new(
             event_loop
-                .create_window(
-                    Window::default_attributes()
-                        .with_title(tab.title.clone())
-                        .with_decorations(false)
-                        .with_transparent(true)
-                        .with_visible(true)
-                        .with_inner_size(winit::dpi::LogicalSize::new(
-                            INITIAL_WIDTH,
-                            INITIAL_HEIGHT,
-                        )),
-                )
+                .create_window(self.window_attributes(&tab.title, width, height))
                 .expect("create detached window"),
         );
 
         if let Some(pos) = outer_pos {
             window.set_outer_position(PhysicalPosition::new(pos.x + 40, pos.y + 40));
+        } else {
+            Self::apply_window_position(&window, &self.config);
         }
 
         match self.theme_mode {
@@ -324,7 +389,11 @@ impl App {
     ) {
         match action {
             MenuAppAction::NewTab => self.spawn_tab(window_id, event_loop),
-            MenuAppAction::DuplicateTab => self.spawn_tab(window_id, event_loop),
+            MenuAppAction::DuplicateTab => {
+                if let Some(ws) = self.windows.get_mut(&window_id) {
+                    ws.duplicate_tab(&self.config, &mut self.next_tab_id, event_loop);
+                }
+            }
             MenuAppAction::CloseTab => self.close_active_tab(window_id, event_loop),
             MenuAppAction::DetachTab => self.detach_active_tab(window_id, event_loop),
             MenuAppAction::Quit => {
@@ -336,6 +405,14 @@ impl App {
                 event_loop.exit();
             }
             MenuAppAction::Theme(mode) => self.apply_theme_mode(mode),
+            MenuAppAction::ToggleAlwaysOnTop => {
+                if let Some(ws) = self.windows.get_mut(&window_id) {
+                    ws.toggle_always_on_top(&mut self.config);
+                }
+            }
+            MenuAppAction::SwitchProfile(name) => {
+                self.switch_profile(&name);
+            }
         }
     }
 
@@ -343,16 +420,29 @@ impl App {
         &mut self,
         window_id: WindowId,
         tab_id: TabId,
+        leaf_id: usize,
         event: TerminalEvent,
         event_loop: &ActiveEventLoop,
     ) {
         match event {
             TerminalEvent::Exit => {
-                self.close_tab(window_id, tab_id, event_loop);
+                if let Some(ws) = self.windows.get_mut(&window_id) {
+                    if let Some(tab) = ws.tabs.tab_by_id(tab_id) {
+                        if tab.leaf_count() <= 1 {
+                            self.close_tab(window_id, tab_id, event_loop);
+                            return;
+                        }
+                    }
+                    if let Some(tab) = ws.tabs.tab_by_id_mut(tab_id) {
+                        tab.root.remove_leaf(leaf_id);
+                        tab.focused_leaf = tab.focused_leaf.min(tab.leaf_count().saturating_sub(1));
+                        ws.sync_terminal_layout(&self.config, event_loop);
+                    }
+                }
             }
             other => {
                 if let Some(ws) = self.windows.get_mut(&window_id) {
-                    ws.handle_terminal_event(&self.config, tab_id, other);
+                    ws.handle_terminal_event(&self.config, tab_id, leaf_id, other);
                 }
             }
         }
@@ -375,6 +465,14 @@ impl App {
             WindowEvent::Resized(size) => {
                 ws.handle_window_resize(&self.config, size, event_loop);
             }
+            WindowEvent::Occluded(false) => {
+                // The window became visible again (e.g. a browser launched from
+                // the shell was closed). Force a fresh paint so any frame that
+                // was dropped while we were covered is restored immediately.
+                ws.request_full_capture();
+                ws.needs_redraw = true;
+                ws.request_redraw();
+            }
             WindowEvent::ScaleFactorChanged { .. } => {
                 let size = ws.window.inner_size();
                 ws.handle_window_resize(&self.config, size, event_loop);
@@ -393,6 +491,9 @@ impl App {
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => {
+                if ws.handle_rename_key(&self.config, &event) {
+                    return;
+                }
                 let (palette_consumed, palette_action) = ws.handle_command_palette_key(
                     &self.config,
                     self.theme_mode,
@@ -424,12 +525,26 @@ impl App {
                     ws.request_redraw();
                     return;
                 }
-                if let Some(action) = key_event_to_action(&event, ws.modifiers) {
+                let (mode, modify_other_keys, ime_composing) = ws.terminal_input_state();
+                if let Some(action) = key_event_to_action(
+                    &event,
+                    ws.modifiers,
+                    mode,
+                    modify_other_keys,
+                    ime_composing,
+                    &self.config.keybindings,
+                ) {
                     if let Some(app_action) = ws.handle_key_action(&self.config, action, event_loop)
                     {
                         self.handle_menu_app_action(window_id, app_action, event_loop);
                     }
                 }
+            }
+            WindowEvent::Ime(ime) => {
+                ws.handle_ime(ime);
+            }
+            WindowEvent::Focused(focused) => {
+                ws.handle_window_focus(focused);
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 let lines = match delta {
@@ -459,12 +574,18 @@ impl App {
                     return;
                 }
 
-                if let Some(tab_index) =
+                if ws.try_report_mouse_wheel(lines, ws.cursor_position.0, ws.cursor_position.1) {
+                    return;
+                }
+
+                if let Some((tab_index, leaf_id)) =
                     ws.tab_index_for_scroll(ws.cursor_position.0, ws.cursor_position.1)
                 {
                     if let Some(tab) = ws.tabs.tab_at_index(tab_index) {
-                        let mut term = tab.session.terminal.lock();
-                        term.scroll_display(Scroll::Delta(lines));
+                        if let Some(session) = tab.leaf_session(leaf_id) {
+                            let mut term = session.terminal.lock();
+                            term.scroll_display(Scroll::Delta(lines));
+                        }
                     }
                 }
                 ws.invalidate_terminal_capture();
@@ -481,18 +602,24 @@ impl App {
                         .and_then(|renderer| renderer.menu_layout())
                         .and_then(|menu| menu.opacity_from_x(position.x));
                     if let Some(value) = value {
-                        ws.apply_slider_opacity(self.theme_mode, value);
+                        ws.apply_slider_opacity(&self.config, self.theme_mode, value);
                     }
                     return;
                 }
 
                 if ws.sidebar_dragging {
-                    ws.update_resize_cursor(position.x, position.y);
+                    ws.update_resize_cursor(&self.config, position.x, position.y);
                     ws.apply_sidebar_width(&self.config, position.x as f32, event_loop);
                     return;
                 }
 
-                ws.update_resize_cursor(position.x, position.y);
+                if ws.split_dragging() {
+                    ws.update_resize_cursor(&self.config, position.x, position.y);
+                    ws.apply_split_divider_drag(&self.config, position.x, position.y, event_loop);
+                    return;
+                }
+
+                ws.update_resize_cursor(&self.config, position.x, position.y);
                 let on_link = ws.modifiers.control_key()
                     && ws.url_at_position(position.x, position.y).is_some();
                 if on_link {
@@ -502,26 +629,12 @@ impl App {
                     ws.needs_redraw = true;
                     ws.request_redraw();
                 }
-                if ws.selecting && ws.is_in_terminal(position.x, position.y) {
-                    if let Some(tab) = ws.tabs.active_tab() {
-                        let mut term = tab.session.terminal.lock();
-                        let point = grid_point_from_position(
-                            &ws.layout,
-                            term.grid().display_offset(),
-                            position.x,
-                            position.y,
-                        );
-                        let side = side_from_position(&ws.layout, position.x);
-                        if let Some(selection) = term.selection.as_mut() {
-                            selection.update(point, side);
-                        }
-                    }
-                    // Selection changes don't always surface as grid damage for
-                    // every affected row, so force a full recapture/redraw to keep
-                    // the highlight consistent while dragging.
-                    ws.request_full_capture();
-                    ws.needs_redraw = true;
-                    ws.request_redraw();
+                let mouse_motion_reported = ws.try_report_mouse_motion(position.x, position.y);
+                if !mouse_motion_reported
+                    && ws.selecting
+                    && ws.is_in_terminal(position.x, position.y)
+                {
+                    let _ = ws.update_selection_drag(position.x, position.y);
                 }
             }
             WindowEvent::MouseInput { state, button, .. } => {
@@ -530,6 +643,10 @@ impl App {
                 if button == MouseButton::Left && state == ElementState::Released {
                     ws.sidebar_dragging = false;
                     ws.menu_slider_dragging = false;
+                    ws.end_split_divider_drag();
+                    if ws.is_in_tab_strip(position.0, position.1) {
+                        ws.finish_tab_drag(position.0, position.1);
+                    }
                 }
 
                 if state == ElementState::Pressed
@@ -564,6 +681,13 @@ impl App {
                     return;
                 }
 
+                if state == ElementState::Pressed
+                    && button == MouseButton::Left
+                    && ws.start_split_divider_drag(&self.config, position.0, position.1)
+                {
+                    return;
+                }
+
                 if ws.is_in_tab_strip(position.0, position.1)
                     || ws.is_in_title_bar(position.0, position.1)
                 {
@@ -579,8 +703,24 @@ impl App {
                     return;
                 }
 
+                if state == ElementState::Pressed
+                    && button == MouseButton::Left
+                    && ws.try_scrollbar_click(position.0, position.1)
+                {
+                    return;
+                }
+
+                if ws.try_report_mouse_button(button, state, position.0, position.1) {
+                    return;
+                }
+
                 if button == MouseButton::Right && state == ElementState::Pressed {
-                    ws.paste_from_clipboard();
+                    ws.paste_from_clipboard(&self.config);
+                    return;
+                }
+
+                if button == MouseButton::Middle && state == ElementState::Pressed {
+                    ws.paste_primary(&self.config);
                     return;
                 }
 
@@ -597,6 +737,16 @@ impl App {
                         }
                         if let Some(slot) = ws.pane_at(position.0, position.1) {
                             ws.focus_pane_slot(slot, &self.config);
+                        }
+                        if ws.modifiers.alt_key() {
+                            ws.selecting = true;
+                            ws.start_selection_at(
+                                position.0,
+                                position.1,
+                                SelectionType::Block,
+                                false,
+                            );
+                            return;
                         }
                         let clicks = ws.register_click(position.0, position.1);
                         match clicks {
@@ -619,21 +769,7 @@ impl App {
                                 );
                             }
                             _ => {
-                                ws.selecting = true;
-                                if let Some(tab) = ws.tabs.active_tab() {
-                                    let mut term = tab.session.terminal.lock();
-                                    let point = grid_point_from_position(
-                                        &ws.layout,
-                                        term.grid().display_offset(),
-                                        position.0,
-                                        position.1,
-                                    );
-                                    let side = side_from_position(&ws.layout, position.0);
-                                    term.selection =
-                                        Some(Selection::new(SelectionType::Simple, point, side));
-                                }
-                                ws.needs_redraw = true;
-                                ws.request_redraw();
+                                ws.begin_simple_selection(position.0, position.1);
                             }
                         }
                     }
@@ -685,7 +821,7 @@ impl App {
                             }
                             MenuHit::Opacity(value) => {
                                 ws.menu_slider_dragging = true;
-                                ws.apply_slider_opacity(self.theme_mode, value);
+                                ws.apply_slider_opacity(&self.config, self.theme_mode, value);
                             }
                             MenuHit::Keep => {}
                         }
@@ -725,31 +861,6 @@ impl App {
     }
 }
 
-fn grid_point_from_position(
-    layout: &crate::render::TerminalLayout,
-    display_offset: usize,
-    x: f64,
-    y: f64,
-) -> Point {
-    let x = x - f64::from(layout.content_offset_x);
-    let y = y - f64::from(layout.content_offset_y);
-    let col = (x / f64::from(layout.cell_width)).floor().max(0.0) as usize;
-    let row = (y / f64::from(layout.cell_height)).floor().max(0.0) as usize;
-    let max_row = layout.rows.saturating_sub(1) as usize;
-    let max_col = layout.cols.saturating_sub(1) as usize;
-    let viewport = Point::new(row.min(max_row), Column(col.min(max_col)));
-    viewport_to_point(display_offset, viewport)
-}
-
-fn side_from_position(layout: &crate::render::TerminalLayout, x: f64) -> Side {
-    let col = (x - f64::from(layout.content_offset_x)) / f64::from(layout.cell_width);
-    if col.fract() > 0.5 {
-        Side::Right
-    } else {
-        Side::Left
-    }
-}
-
 impl ApplicationHandler<UserEvent> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.windows.is_empty() {
@@ -771,15 +882,17 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::Terminal {
                 window_id,
                 tab_id,
+                leaf_id,
                 event,
             } => {
                 let resolved = self.find_window_for_tab(tab_id).unwrap_or(window_id);
-                self.handle_terminal_event(resolved, tab_id, event, event_loop);
+                self.handle_terminal_event(resolved, tab_id, leaf_id, event, event_loop);
             }
         }
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        self.reload_config_if_changed();
         let window_ids: Vec<WindowId> = self.windows.keys().copied().collect();
         let mut next_tab_id = self.next_tab_id;
 
@@ -797,7 +910,7 @@ impl ApplicationHandler<UserEvent> for App {
 
                 ws.flush_pty_resize(event_loop);
 
-                let busy = ws.refresh_tab_activity();
+                let busy = ws.refresh_tab_activity(self.config.terminal.busy_heuristic_ms);
                 let interval = if busy {
                     BUSY_POLL_INTERVAL
                 } else {
@@ -819,6 +932,19 @@ impl ApplicationHandler<UserEvent> for App {
                         ws.bell_flash_until = None;
                         ws.needs_redraw = true;
                     }
+                }
+
+                if let Some(until) = ws.blink_wake_deadline() {
+                    if now < until {
+                        next_wake = Some(next_wake.map_or(until, |w| w.min(until)));
+                    } else {
+                        ws.tick_cursor_blink();
+                    }
+                } else {
+                    ws.ensure_blink_timer();
+                }
+                if let Some(until) = ws.blink_wake_deadline() {
+                    next_wake = Some(next_wake.map_or(until, |w| w.min(until)));
                 }
 
                 if ws.needs_redraw {

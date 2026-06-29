@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use alacritty_terminal::event::EventListener;
+use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line, Point};
 use alacritty_terminal::selection::SelectionRange;
 use alacritty_terminal::term::cell::{Cell, Flags};
@@ -9,6 +10,8 @@ use alacritty_terminal::term::{
     point_to_viewport, viewport_to_point, LineDamageBounds, RenderableCursor, Term, TermDamage,
 };
 use alacritty_terminal::vte::ansi::CursorShape;
+
+use crate::profile_scope;
 
 /// Describes which terminal rows changed since the last frame.
 #[derive(Clone, Debug, Default)]
@@ -67,6 +70,11 @@ pub struct TerminalFrame {
     /// URL spans to highlight when Ctrl is held over a link.
     pub link_hovers: Vec<SearchMatch>,
     pub display_offset: usize,
+    /// Scrollback lines above the visible viewport (0 when pinned to bottom).
+    pub scroll_history: usize,
+    pub cursor_visible: bool,
+    /// When false, SGR 5 blink cells skip foreground glyph drawing.
+    pub text_blink_visible: bool,
     pub colors: Arc<Colors>,
 }
 
@@ -148,6 +156,10 @@ fn capture_full_into<T: EventListener>(
     ensure_row_buffer(buffer, row_count);
     let content = term.renderable_content();
     frame.display_offset = content.display_offset;
+    frame.scroll_history = term
+        .grid()
+        .total_lines()
+        .saturating_sub(term.grid().screen_lines());
     frame.selection = content.selection;
     frame.colors = Arc::new(*content.colors);
     frame.cursor = content.cursor;
@@ -227,6 +239,10 @@ fn capture_partial_into<T: EventListener>(
     frame.cursor = content.cursor;
     frame.selection = content.selection;
     frame.display_offset = display_offset;
+    frame.scroll_history = term
+        .grid()
+        .total_lines()
+        .saturating_sub(term.grid().screen_lines());
     frame.colors = Arc::new(*content.colors);
 }
 
@@ -240,6 +256,7 @@ pub fn capture_terminal_frame<T: EventListener>(
     col_count: usize,
     force_full: bool,
 ) -> FrameDamage {
+    profile_scope!("capture_terminal_frame");
     let damage = read_term_damage(term, force_full);
 
     match &damage {
@@ -254,6 +271,10 @@ pub fn capture_terminal_frame<T: EventListener>(
             frame.cursor = content.cursor;
             frame.selection = content.selection;
             frame.display_offset = content.display_offset;
+            frame.scroll_history = term
+                .grid()
+                .total_lines()
+                .saturating_sub(term.grid().screen_lines());
         }
     }
 
@@ -274,7 +295,55 @@ pub fn empty_terminal_frame(row_count: usize, colors: Arc<Colors>) -> TerminalFr
         search_active_match: None,
         link_hovers: Vec::new(),
         display_offset: 0,
+        scroll_history: 0,
+        cursor_visible: true,
+        text_blink_visible: true,
         colors,
+    }
+}
+
+/// Returns true when any visible cell carries the SGR 5 blink attribute.
+pub fn frame_has_blink_cells(frame: &TerminalFrame) -> bool {
+    frame.rows.iter().any(|row| {
+        row.iter()
+            .any(|(_, cell)| cell.flags.contains(Flags::BLINK))
+    })
+}
+
+/// Merge blink-row damage into an existing frame damage snapshot.
+pub fn merge_blink_damage(
+    damage: FrameDamage,
+    frame: &TerminalFrame,
+    col_count: usize,
+) -> FrameDamage {
+    use alacritty_terminal::term::LineDamageBounds;
+
+    let blink_lines: Vec<LineDamageBounds> = frame
+        .rows
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| {
+            row.iter()
+                .any(|(_, cell)| cell.flags.contains(Flags::BLINK))
+        })
+        .map(|(line, _)| LineDamageBounds::new(line, 0, col_count.saturating_sub(1)))
+        .collect();
+
+    if blink_lines.is_empty() {
+        return damage;
+    }
+
+    match damage {
+        FrameDamage::Full => FrameDamage::Full,
+        FrameDamage::None => FrameDamage::Partial(blink_lines),
+        FrameDamage::Partial(mut lines) => {
+            for bounds in blink_lines {
+                if !lines.iter().any(|existing| existing.line == bounds.line) {
+                    lines.push(bounds);
+                }
+            }
+            FrameDamage::Partial(lines)
+        }
     }
 }
 
@@ -282,6 +351,7 @@ pub fn empty_terminal_frame(row_count: usize, colors: Arc<Colors>) -> TerminalFr
 mod tests {
     use super::*;
     use alacritty_terminal::event::VoidListener;
+    use alacritty_terminal::index::{Column, Line};
     use alacritty_terminal::grid::Dimensions;
     use alacritty_terminal::term::Config as TermConfig;
     use alacritty_terminal::vte::ansi::{Color, NamedColor, Processor};
@@ -300,6 +370,46 @@ mod tests {
         fn columns(&self) -> usize {
             self.cols
         }
+    }
+
+    #[test]
+    fn merge_blink_damage_marks_blink_rows() {
+        let mut frame = empty_terminal_frame(2, Arc::new(Colors::default()));
+        frame.rows[1].push((
+            Point::new(Line(0), Column(0)),
+            Cell {
+                c: '!',
+                flags: Flags::BLINK,
+                ..Cell::default()
+            },
+        ));
+        let merged = merge_blink_damage(FrameDamage::None, &frame, 10);
+        assert!(matches!(merged, FrameDamage::Partial(lines) if lines.len() == 1 && lines[0].line == 1));
+    }
+
+    #[test]
+    fn sgr5_sets_blink_flag_in_captured_frame() {
+        let cols = 20usize;
+        let rows = 3usize;
+        let dims = Dims { cols, rows };
+        let mut term = Term::new(TermConfig::default(), &dims, VoidListener);
+        let mut parser: Processor = Processor::new();
+        parser.advance(&mut term, b"normal \x1b[5mblink\x1b[0m end\r\n");
+
+        let mut buffer: TerminalRowBuffer = Vec::new();
+        let mut scratch: Vec<(Point, Cell)> = Vec::new();
+        let mut frame = empty_terminal_frame(rows, Arc::new(Colors::default()));
+        capture_terminal_frame(
+            &mut buffer,
+            &mut scratch,
+            &mut frame,
+            &mut term,
+            rows,
+            cols,
+            true,
+        );
+
+        assert!(frame_has_blink_cells(&frame));
     }
 
     #[test]

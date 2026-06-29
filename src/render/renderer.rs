@@ -13,6 +13,8 @@ use winit::dpi::PhysicalSize;
 use winit::window::Window;
 
 use crate::config::Config;
+use crate::render::background::BackgroundImage;
+use crate::render::background_shader::draw_background_shader;
 use crate::render::chrome::ChromeMetrics;
 use crate::render::frame::{FrameDamage, TerminalFrame};
 use crate::render::layout::GRID_GUTTER;
@@ -30,6 +32,7 @@ pub struct PaneRender<'a> {
     pub frame: &'a TerminalFrame,
     pub layout: TerminalLayout,
     pub damage: &'a FrameDamage,
+    pub ime_preedit: Option<&'a str>,
 }
 
 pub struct ChromeFrame<'a> {
@@ -55,6 +58,10 @@ pub struct SearchOverlayFrame<'a> {
     pub query: &'a str,
     pub match_count: usize,
     pub current_match: usize,
+    pub case_sensitive: bool,
+    pub use_regex: bool,
+    pub whole_word: bool,
+    pub regex_error: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -66,6 +73,7 @@ pub struct RenameOverlayFrame<'a> {
 pub struct CommandPaletteFrame<'a> {
     pub query: &'a str,
     pub entries: &'a [String],
+    pub selected_index: usize,
 }
 
 pub struct GpuRenderer {
@@ -90,6 +98,7 @@ pub struct GpuRenderer {
     search_panel_bounds: Option<Rect>,
     search_close_bounds: Option<Rect>,
     config: Config,
+    background: Option<BackgroundImage>,
 }
 
 /// Result of a mouse click while the search overlay is visible.
@@ -137,6 +146,7 @@ impl GpuRenderer {
             VelloRenderer::new(device, options).context("failed to create vello renderer")?;
 
         let cached_theme = UiTheme::from_config(&config);
+        let background = BackgroundImage::from_config(&config).ok().flatten();
 
         Ok(Self {
             render_context,
@@ -160,6 +170,7 @@ impl GpuRenderer {
             search_panel_bounds: None,
             search_close_bounds: None,
             config,
+            background,
         })
     }
 
@@ -179,6 +190,7 @@ impl GpuRenderer {
 
     pub fn set_config(&mut self, config: Config) {
         self.cached_theme = UiTheme::from_config(&config);
+        self.background = BackgroundImage::from_config(&config).ok().flatten();
         self.config = config;
         self.invalidate_text_cache();
     }
@@ -246,6 +258,7 @@ impl GpuRenderer {
         focused_pane: usize,
         frame: ChromeFrame<'_>,
     ) -> Result<RenderTimings> {
+        let _render_span = tracing::trace_span!("render_panes").entered();
         let scene_start = Instant::now();
         let width = self
             .surface
@@ -278,6 +291,7 @@ impl GpuRenderer {
                 &mut self.font_cx,
                 frame.terminal_opacity,
                 effective_damage,
+                pane.ime_preedit,
             );
             if effective_damage.is_full() {
                 self.pane_scene_initialized[index] = true;
@@ -285,6 +299,52 @@ impl GpuRenderer {
         }
 
         self.scene.reset();
+
+        if let Some(background) = self.background.as_ref() {
+            if !background.matches_config(&self.config) {
+                self.background = BackgroundImage::from_config(&self.config).ok().flatten();
+            }
+        } else if self.config.appearance.background_image.is_some() {
+            self.background = BackgroundImage::from_config(&self.config).ok().flatten();
+        }
+
+        if let Some(background) = self.background.as_ref() {
+            let content_x = f64::from(frame.metrics.content_offset_x());
+            let content_y = f64::from(frame.metrics.content_offset_y());
+            let width = self
+                .surface
+                .as_ref()
+                .map(|surface| surface.config.width)
+                .unwrap_or(1) as f64;
+            let height = self
+                .surface
+                .as_ref()
+                .map(|surface| surface.config.height)
+                .unwrap_or(1) as f64;
+            background.draw(
+                &mut self.scene,
+                Rect::new(content_x, content_y, width, height),
+            );
+        }
+
+        let content_x = f64::from(frame.metrics.content_offset_x());
+        let content_y = f64::from(frame.metrics.content_offset_y());
+        let content_width = self
+            .surface
+            .as_ref()
+            .map(|surface| surface.config.width)
+            .unwrap_or(1) as f64;
+        let content_height = self
+            .surface
+            .as_ref()
+            .map(|surface| surface.config.height)
+            .unwrap_or(1) as f64;
+        draw_background_shader(
+            &mut self.scene,
+            Rect::new(content_x, content_y, content_width, content_height),
+            &self.config,
+        );
+
         for terminal_scene in self.pane_terminal_scenes.iter().take(panes.len()) {
             self.scene.append(terminal_scene, None);
         }
@@ -381,38 +441,43 @@ impl GpuRenderer {
             );
             self.tab_strip_layout = Some(tab_layout);
 
-            let title_layout = TitleBarLayout::compute(frame.metrics.title_bar, 0.0, width);
-            let menu_anchor = if frame.menu_open {
-                Some(title_layout.hamburger_anchor())
-            } else {
-                None
-            };
-            self.title_bar_renderer.render(
-                &mut self.chrome_scene,
-                &title_layout,
-                frame.window_title,
-                &self.config,
-                &mut self.font_cx,
-                &mut self.scene_builder.layout_cx,
-                self.layout.font_size,
-                frame.menu_open,
-            );
-            self.title_bar_layout = Some(title_layout);
-
-            if let Some((anchor_x, anchor_y)) = menu_anchor {
-                let menu_layout =
-                    MenuLayout::compute(anchor_x, anchor_y, width, frame.menu_entries);
-                self.menu_renderer.render(
+            if frame.metrics.title_bar.height > 0.0 {
+                let title_layout = TitleBarLayout::compute(frame.metrics.title_bar, 0.0, width);
+                let menu_anchor = if frame.menu_open {
+                    Some(title_layout.hamburger_anchor())
+                } else {
+                    None
+                };
+                self.title_bar_renderer.render(
                     &mut self.chrome_scene,
-                    &menu_layout,
-                    frame.menu_entries,
+                    &title_layout,
+                    frame.window_title,
                     &self.config,
                     &mut self.font_cx,
                     &mut self.scene_builder.layout_cx,
                     self.layout.font_size,
+                    frame.menu_open,
                 );
-                self.menu_layout = Some(menu_layout);
+                self.title_bar_layout = Some(title_layout);
+
+                if let Some((anchor_x, anchor_y)) = menu_anchor {
+                    let menu_layout =
+                        MenuLayout::compute(anchor_x, anchor_y, width, frame.menu_entries);
+                    self.menu_renderer.render(
+                        &mut self.chrome_scene,
+                        &menu_layout,
+                        frame.menu_entries,
+                        &self.config,
+                        &mut self.font_cx,
+                        &mut self.scene_builder.layout_cx,
+                        self.layout.font_size,
+                    );
+                    self.menu_layout = Some(menu_layout);
+                } else {
+                    self.menu_layout = None;
+                }
             } else {
+                self.title_bar_layout = None;
                 self.menu_layout = None;
             }
 
@@ -442,10 +507,11 @@ impl GpuRenderer {
 
         let scene_elapsed = scene_start.elapsed();
         let gpu_start = Instant::now();
-        self.render_scene(frame.terminal_opacity)?;
+        let presented = self.render_scene(frame.terminal_opacity)?;
         Ok(RenderTimings {
             scene: scene_elapsed,
             gpu: gpu_start.elapsed(),
+            presented,
         })
     }
 
@@ -505,7 +571,7 @@ impl GpuRenderer {
         let list_top = y0 + 42.0;
         for (index, entry) in palette.entries.iter().take(visible_entries).enumerate() {
             let row_y = list_top + index as f64 * row_h;
-            if index == 0 {
+            if index == palette.selected_index {
                 let selected = RoundedRect::new(
                     x0 + 8.0,
                     row_y - 3.0,
@@ -591,17 +657,34 @@ impl GpuRenderer {
             &close_rect,
         );
 
-        let label = if search.query.is_empty() {
-            "Search...  (Esc to close, Enter next, Shift+Enter prev)".to_owned()
-        } else if search.match_count == 0 {
-            format!("Search: {}  (no matches)", search.query)
-        } else {
-            format!(
-                "Search: {}  ({}/{})",
-                search.query,
-                search.current_match + 1,
-                search.match_count
-            )
+        let label = {
+            let mut modes = Vec::new();
+            if search.case_sensitive {
+                modes.push("case");
+            } else {
+                modes.push("ignore case");
+            }
+            if search.use_regex {
+                modes.push("regex");
+            }
+            if search.whole_word {
+                modes.push("word");
+            }
+            let mode = modes.join(", ");
+            if search.regex_error {
+                format!("Search: {}  (invalid regex)", search.query)
+            } else if search.query.is_empty() {
+                format!("Search...  ({mode}, Alt+C/R/W, Esc close)")
+            } else if search.match_count == 0 {
+                format!("Search: {}  (no matches, {mode})", search.query)
+            } else {
+                format!(
+                    "Search: {}  ({}/{})  ({mode})",
+                    search.query,
+                    search.current_match + 1,
+                    search.match_count
+                )
+            }
         };
         let family = font_family_from_config(&self.config);
         let font_size = (self.layout.font_size * 0.78).clamp(11.0, 14.0);
@@ -698,7 +781,7 @@ impl GpuRenderer {
     fn render_perf_overlay(&mut self, stats: &PerfStatsSnapshot, width: f64, frame: &ChromeFrame) {
         let panel_w = 220.0;
         let line_h = 14.0;
-        let panel_h = 100.0;
+        let panel_h = 118.0;
         let title_h = f64::from(frame.metrics.title_bar.height);
         let x0 = (width - panel_w - 12.0).max(f64::from(frame.metrics.content_offset_x()) + 12.0);
         let y0 = title_h + 10.0;
@@ -751,9 +834,43 @@ impl GpuRenderer {
                 Some((panel_w - 20.0) as f32),
             );
         }
+
+        let graph_y = y0 + 88.0;
+        let graph_h = 20.0;
+        let graph_w = panel_w - 20.0;
+        let count = stats.fps_history_len.min(60);
+        if count > 1 {
+            let max_fps = stats
+                .fps_history
+                .iter()
+                .take(count)
+                .copied()
+                .fold(1.0f32, f32::max);
+            for i in 0..count {
+                let fps = stats.fps_history[i];
+                let bar_h = (fps / max_fps) * graph_h as f32;
+                let bx0 = x0 + 10.0 + (i as f64 / count as f64) * graph_w;
+                let bx1 = x0 + 10.0 + ((i + 1) as f64 / count as f64) * graph_w;
+                self.scene.fill(
+                    Fill::NonZero,
+                    Affine::IDENTITY,
+                    &self.cached_theme.accent_brush(),
+                    None,
+                    &Rect::new(
+                        bx0,
+                        graph_y + graph_h - f64::from(bar_h),
+                        bx1 - 0.5,
+                        graph_y + graph_h,
+                    ),
+                );
+            }
+        }
     }
 
-    fn render_scene(&mut self, terminal_opacity: f32) -> Result<()> {
+    /// Renders the current scene and presents it. Returns `false` when the
+    /// surface texture could not be acquired (the frame was dropped), so the
+    /// caller can retry instead of leaving a stale frame on screen.
+    fn render_scene(&mut self, terminal_opacity: f32) -> Result<bool> {
         let surface = self
             .surface
             .as_mut()
@@ -766,7 +883,7 @@ impl GpuRenderer {
         let width = surface.config.width;
         let height = surface.config.height;
         if width == 0 || height == 0 {
-            return Ok(());
+            return Ok(false);
         }
 
         let device = &self.render_context.devices[surface.dev_id].device;
@@ -798,7 +915,7 @@ impl GpuRenderer {
             | wgpu::CurrentSurfaceTexture::Suboptimal(texture) => texture,
             wgpu::CurrentSurfaceTexture::Timeout
             | wgpu::CurrentSurfaceTexture::Occluded
-            | wgpu::CurrentSurfaceTexture::Outdated => return Ok(()),
+            | wgpu::CurrentSurfaceTexture::Outdated => return Ok(false),
             other => {
                 return Err(anyhow::anyhow!(
                     "failed to acquire surface texture: {other:?}"
@@ -820,7 +937,7 @@ impl GpuRenderer {
         queue.submit(Some(encoder.finish()));
         surface_texture.present();
 
-        Ok(())
+        Ok(true)
     }
 }
 
