@@ -13,11 +13,13 @@ use vte::ansi::ModifyOtherKeys;
 use crate::pty::output_tap::{PtyOutputTap, TapEvent};
 
 /// PTY wrapper that scans output for OSC 7 and modifyOtherKeys sequences.
+#[cfg(unix)]
 pub struct TappingPty {
     inner: tty::Pty,
     io: TapFile,
 }
 
+#[cfg(unix)]
 pub struct TapFile {
     file: std::fs::File,
     tap: PtyOutputTap,
@@ -27,6 +29,22 @@ pub struct TapFile {
     last_output_at: Arc<Mutex<Option<Instant>>>,
 }
 
+/// On Windows the portable ConPTY backend does not expose cloneable PTY file handles.
+/// Delegate to the inner PTY for now; OSC tap hooks can be added when pipe wrapping lands.
+#[cfg(windows)]
+pub struct TappingPty {
+    inner: tty::Pty,
+    #[allow(dead_code)]
+    cwd: Arc<Mutex<Option<PathBuf>>>,
+    #[allow(dead_code)]
+    modify_other_keys: Arc<Mutex<ModifyOtherKeys>>,
+    #[allow(dead_code)]
+    notifier: Arc<Mutex<Option<Notifier>>>,
+    #[allow(dead_code)]
+    last_output_at: Arc<Mutex<Option<Instant>>>,
+}
+
+#[cfg(unix)]
 impl TappingPty {
     pub fn new(
         inner: tty::Pty,
@@ -58,6 +76,26 @@ impl TappingPty {
     }
 }
 
+#[cfg(windows)]
+impl TappingPty {
+    pub fn new(
+        inner: tty::Pty,
+        cwd: Arc<Mutex<Option<PathBuf>>>,
+        modify_other_keys: Arc<Mutex<ModifyOtherKeys>>,
+        notifier: Arc<Mutex<Option<Notifier>>>,
+        last_output_at: Arc<Mutex<Option<Instant>>>,
+    ) -> io::Result<Self> {
+        Ok(Self {
+            inner,
+            cwd,
+            modify_other_keys,
+            notifier,
+            last_output_at,
+        })
+    }
+}
+
+#[cfg(unix)]
 impl TapFile {
     fn handle_tap_events(&self, events: Vec<TapEvent>) {
         for event in events {
@@ -87,6 +125,7 @@ impl TapFile {
     }
 }
 
+#[cfg(unix)]
 impl Read for TapFile {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let n = self.file.read(buf)?;
@@ -99,6 +138,7 @@ impl Read for TapFile {
     }
 }
 
+#[cfg(unix)]
 impl Write for TapFile {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.file.write(buf)
@@ -109,6 +149,7 @@ impl Write for TapFile {
     }
 }
 
+#[cfg(unix)]
 impl EventedReadWrite for TappingPty {
     type Reader = TapFile;
     type Writer = TapFile;
@@ -141,6 +182,42 @@ impl EventedReadWrite for TappingPty {
 
     fn writer(&mut self) -> &mut Self::Writer {
         &mut self.io
+    }
+}
+
+#[cfg(windows)]
+impl EventedReadWrite for TappingPty {
+    type Reader = <tty::Pty as EventedReadWrite>::Reader;
+    type Writer = <tty::Pty as EventedReadWrite>::Writer;
+
+    unsafe fn register(
+        &mut self,
+        poll: &Arc<Poller>,
+        interest: Event,
+        poll_opts: PollMode,
+    ) -> io::Result<()> {
+        unsafe { self.inner.register(poll, interest, poll_opts) }
+    }
+
+    fn reregister(
+        &mut self,
+        poll: &Arc<Poller>,
+        interest: Event,
+        poll_opts: PollMode,
+    ) -> io::Result<()> {
+        self.inner.reregister(poll, interest, poll_opts)
+    }
+
+    fn deregister(&mut self, poll: &Arc<Poller>) -> io::Result<()> {
+        self.inner.deregister(poll)
+    }
+
+    fn reader(&mut self) -> &mut Self::Reader {
+        self.inner.reader()
+    }
+
+    fn writer(&mut self) -> &mut Self::Writer {
+        self.inner.writer()
     }
 }
 
