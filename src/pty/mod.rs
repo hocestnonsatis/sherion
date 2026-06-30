@@ -16,6 +16,7 @@ use vte::ansi::ModifyOtherKeys;
 use crate::config::Config;
 use crate::event::EventProxy;
 use crate::render::TerminalLayout;
+use crate::security::validate_spawn_cwd;
 use crate::terminal_setup;
 
 #[cfg(windows)]
@@ -75,13 +76,23 @@ impl PtySession {
         pty_options
             .env
             .insert("COLORTERM".to_owned(), "truecolor".to_owned());
-        pty_options.working_directory = working_directory;
+        pty_options.working_directory = working_directory.and_then(|path| {
+            validate_spawn_cwd(&path).or_else(|| {
+                tracing::warn!(path = %path.display(), "ignoring invalid spawn working directory");
+                None
+            })
+        });
 
         if !config.terminal.shell.is_empty() {
             pty_options.shell = Some(Shell::new(
                 config.terminal.shell.clone(),
                 config.terminal.shell_args.clone(),
             ));
+        }
+
+        #[cfg(windows)]
+        if !config.terminal.shell_args.is_empty() {
+            pty_options.escape_args = true;
         }
 
         let window_size = layout.window_size();

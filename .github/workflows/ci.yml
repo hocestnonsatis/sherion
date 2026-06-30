@@ -27,3 +27,15 @@ jobs:
       - run: cargo build --release
       - run: cargo test
       - run: cargo test --features simd-utf8
+
+  security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install security tools
+        run: |
+          cargo install cargo-audit --version 0.22.2 --locked
+          cargo install cargo-deny --version 0.19.9 --locked
+      - run: cargo audit
+      - run: cargo deny check

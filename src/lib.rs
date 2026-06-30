@@ -13,6 +13,7 @@ pub mod platform;
 pub mod profiler;
 pub mod pty;
 pub mod render;
+pub mod security;
 pub mod split;
 pub mod tabs;
 pub mod terminal_clone;

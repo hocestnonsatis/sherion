@@ -83,7 +83,13 @@ sherion --profile dark
 
 ## Configuration
 
-Copy or edit [`sherion.toml`](sherion.toml) in the project root, or point to a custom file:
+Sherion reads config from (in order):
+
+1. `SHERION_CONFIG` environment variable
+2. `~/.config/sherion/sherion.toml` (or `$XDG_CONFIG_HOME/sherion/sherion.toml`)
+3. `./sherion.toml` in the current directory (legacy fallback)
+
+Copy or edit [`sherion.toml`](sherion.toml) as a starting point. See [SECURITY.md](SECURITY.md) for hardening guidance.
 
 ```bash
 SHERION_CONFIG=/path/to/sherion.toml sherion

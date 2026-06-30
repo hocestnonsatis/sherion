@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -7,6 +7,8 @@ use vello::peniko::color::{AlphaColor, Srgb};
 use winit::window::Theme;
 
 const DEFAULT_CONFIG_PATH: &str = "sherion.toml";
+const XDG_CONFIG_DIR: &str = "sherion";
+const XDG_CONFIG_FILE: &str = "sherion.toml";
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct Config {
@@ -441,9 +443,48 @@ fn default_cursor_style() -> String {
 }
 
 pub fn config_path() -> PathBuf {
-    std::env::var_os("SHERION_CONFIG")
-        .map(PathBuf::from)
+    if let Some(path) = std::env::var_os("SHERION_CONFIG") {
+        return PathBuf::from(path);
+    }
+
+    let xdg = xdg_config_path();
+    if xdg.exists() {
+        return xdg;
+    }
+
+    let local = PathBuf::from(DEFAULT_CONFIG_PATH);
+    if local.exists() {
+        return local;
+    }
+
+    xdg
+}
+
+fn xdg_config_path() -> PathBuf {
+    if let Some(config_home) = std::env::var_os("XDG_CONFIG_HOME") {
+        return PathBuf::from(config_home)
+            .join(XDG_CONFIG_DIR)
+            .join(XDG_CONFIG_FILE);
+    }
+
+    std::env::var_os("HOME")
+        .map(|home| {
+            PathBuf::from(home)
+                .join(".config")
+                .join(XDG_CONFIG_DIR)
+                .join(XDG_CONFIG_FILE)
+        })
         .unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_PATH))
+}
+
+fn ensure_config_parent(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create config directory {}", parent.display()))?;
+        }
+    }
+    Ok(())
 }
 
 impl Config {
@@ -499,6 +540,7 @@ impl Config {
 
     pub fn save(&self) -> Result<()> {
         let path = config_path();
+        ensure_config_parent(&path)?;
         let contents = toml::to_string_pretty(self).context("failed to serialize config")?;
         fs::write(&path, contents)
             .with_context(|| format!("failed to write config to {}", path.display()))

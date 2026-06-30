@@ -1167,11 +1167,14 @@ impl WindowState {
             TerminalEvent::ClipboardLoad(clipboard_type, respond) => {
                 if let Some(tab) = self.tabs.tab_by_id(tab_id) {
                     if let Some(session) = tab.leaf_session(leaf_id) {
-                        let text = match clipboard_type {
+                        let mut text = match clipboard_type {
                             ClipboardType::Clipboard => paste_text(),
                             ClipboardType::Selection => paste_primary(),
                         }
                         .unwrap_or_default();
+                        if config.terminal.sanitize_paste {
+                            text = sanitize_paste(&text);
+                        }
                         let response = respond(&text);
                         session
                             .notifier

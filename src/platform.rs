@@ -33,8 +33,44 @@ pub fn play_audible_bell() {
     tracing::debug!("audible bell requested but no platform sound backend available");
 }
 
+/// Returns true when the URL uses an allowed scheme for external opening.
+pub fn is_safe_url(url: &str) -> bool {
+    let url = url.trim();
+    if url.is_empty() {
+        return false;
+    }
+
+    if let Some(rest) = url.strip_prefix("https://") {
+        return !rest.is_empty();
+    }
+    if let Some(rest) = url.strip_prefix("http://") {
+        return !rest.is_empty();
+    }
+    if url.starts_with("mailto:") {
+        return is_safe_mailto(url);
+    }
+
+    false
+}
+
+fn is_safe_mailto(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("mailto:") else {
+        return false;
+    };
+    if rest.is_empty() || rest.contains(['\n', '\r', '?', '&']) {
+        return false;
+    }
+    let lower = rest.to_ascii_lowercase();
+    !(lower.contains("%0a") || lower.contains("%0d"))
+}
+
 /// Open a URL with the platform default handler.
 pub fn open_url(url: &str) -> bool {
+    if !is_safe_url(url) {
+        tracing::warn!(%url, "refusing to open URL with disallowed scheme");
+        return false;
+    }
+
     let result = {
         #[cfg(target_os = "linux")]
         {
@@ -78,5 +114,41 @@ pub fn open_url(url: &str) -> bool {
             tracing::warn!(%error, %url, "failed to open URL");
             false
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn allows_http_and_https_urls() {
+        assert!(is_safe_url("https://example.com/path"));
+        assert!(is_safe_url("http://localhost:8080"));
+    }
+
+    #[test]
+    fn allows_mailto_urls() {
+        assert!(is_safe_url("mailto:user@example.com"));
+    }
+
+    #[test]
+    fn rejects_file_and_javascript_urls() {
+        assert!(!is_safe_url("file:///etc/passwd"));
+        assert!(!is_safe_url("javascript:alert(1)"));
+        assert!(!is_safe_url("data:text/html,hello"));
+    }
+
+    #[test]
+    fn rejects_mailto_header_injection() {
+        assert!(!is_safe_url("mailto:a@b.com%0aBcc:c@evil.com"));
+        assert!(!is_safe_url("mailto:a@b.com?subject=hi&body=bye"));
+        assert!(is_safe_url("mailto:user@example.com"));
+    }
+
+    #[test]
+    fn rejects_empty_scheme_only_urls() {
+        assert!(!is_safe_url("https://"));
+        assert!(!is_safe_url(""));
     }
 }
