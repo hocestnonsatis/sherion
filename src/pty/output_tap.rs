@@ -3,7 +3,6 @@ use std::path::PathBuf;
 use vte::ansi::ModifyOtherKeys;
 
 use crate::osc::parse_osc7_cwd;
-use crate::security::validate_spawn_cwd;
 
 /// Side effects observed while PTY output passes through to the parser.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -110,9 +109,7 @@ impl PtyOutputTap {
 
     fn finish_osc(&mut self) -> Option<TapEvent> {
         let payload = validated_utf8(&self.osc_payload)?;
-        parse_osc7_cwd(payload)
-            .and_then(|path| validate_spawn_cwd(&path))
-            .map(TapEvent::Cwd)
+        parse_osc7_cwd(payload).map(TapEvent::Cwd)
     }
 
     fn finish_csi(&self, final_byte: u8) -> Option<TapEvent> {
