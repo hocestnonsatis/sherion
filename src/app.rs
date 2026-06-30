@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::mpsc::Receiver;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use alacritty_terminal::event::Event as TerminalEvent;
 use alacritty_terminal::grid::Scroll;
@@ -22,6 +23,8 @@ use crate::window_state::{
     INITIAL_HEIGHT, INITIAL_WIDTH, OPACITY_MAX, OPACITY_MIN, STARTUP_SETTLE,
 };
 
+const CONFIG_RELOAD_DEBOUNCE: Duration = Duration::from_millis(400);
+
 pub struct App {
     config: Config,
     proxy: EventLoopProxy<UserEvent>,
@@ -29,6 +32,7 @@ pub struct App {
     next_tab_id: usize,
     windows: HashMap<WindowId, WindowState>,
     config_reload_rx: Option<Receiver<()>>,
+    config_reload_deadline: Option<Instant>,
 }
 
 impl App {
@@ -45,6 +49,7 @@ impl App {
             next_tab_id: 0,
             windows: HashMap::new(),
             config_reload_rx: Self::watch_config_file(),
+            config_reload_deadline: None,
         };
 
         event_loop.run_app(&mut app)?;
@@ -59,8 +64,14 @@ impl App {
         let (tx, rx) = mpsc::channel();
         let path = crate::config::config_path();
         let mut watcher = RecommendedWatcher::new(
-            move |_| {
-                let _ = tx.send(());
+            move |result: notify::Result<notify::Event>| {
+                match result {
+                    Ok(event) if event.kind.is_access() => {}
+                    Ok(_) => {
+                        let _ = tx.send(());
+                    }
+                    Err(_) => {}
+                }
             },
             notify::Config::default(),
         )
@@ -72,18 +83,37 @@ impl App {
         Some(rx)
     }
 
-    fn reload_config_if_changed(&mut self) {
+    /// Returns a wake deadline when a debounced reload is still pending.
+    fn poll_config_reload(&mut self, now: Instant) -> Option<Instant> {
         let Some(rx) = &self.config_reload_rx else {
-            return;
+            return None;
         };
+
+        let mut pending = false;
         while rx.try_recv().is_ok() {
-            if let Ok(config) = Config::load_profile(self.config.active_profile.as_deref()) {
-                self.config = config;
-                for ws in self.windows.values_mut() {
-                    ws.apply_config_reload(&self.config);
-                }
+            pending = true;
+        }
+
+        if pending {
+            self.config_reload_deadline
+                .get_or_insert(now + CONFIG_RELOAD_DEBOUNCE);
+        }
+
+        let Some(deadline) = self.config_reload_deadline else {
+            return None;
+        };
+        if now < deadline {
+            return Some(deadline);
+        }
+
+        self.config_reload_deadline = None;
+        if let Ok(config) = Config::load_profile(self.config.active_profile.as_deref()) {
+            self.config = config;
+            for ws in self.windows.values_mut() {
+                ws.apply_config_reload(&self.config);
             }
         }
+        None
     }
 
     pub fn switch_profile(&mut self, name: &str) {
@@ -783,9 +813,6 @@ impl App {
             }
             WindowEvent::RedrawRequested => {
                 ws.redraw(&self.config, self.theme_mode);
-                if ws.needs_redraw {
-                    ws.request_redraw();
-                }
             }
             _ => {}
         }
@@ -892,13 +919,12 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        self.reload_config_if_changed();
+        let now = Instant::now();
+        let mut next_wake = self.poll_config_reload(now);
         let window_ids: Vec<WindowId> = self.windows.keys().copied().collect();
         let mut next_tab_id = self.next_tab_id;
 
         let mut any_initial_pending = false;
-        let mut next_wake: Option<std::time::Instant> = None;
-        let now = std::time::Instant::now();
 
         for window_id in &window_ids {
             if let Some(ws) = self.windows.get_mut(window_id) {
