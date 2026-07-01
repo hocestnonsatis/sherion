@@ -59,6 +59,47 @@ irm https://github.com/hocestnonsatis/sherion/releases/latest/download/sherion-i
 
 **Windows (MSI)** — download `sherion-x86_64-pc-windows-msvc.msi` from [Releases](https://github.com/hocestnonsatis/sherion/releases).
 
+**macOS (Homebrew)**
+
+```bash
+brew install hocestnonsatis/tap/sherion
+```
+
+Requires the [`hocestnonsatis/homebrew-tap`](https://github.com/hocestnonsatis/homebrew-tap) repository and `HOMEBREW_TAP_TOKEN` secret on the main repo for automated formula updates.
+
+**Linux (.deb)**
+
+Download `sherion_*_amd64.deb` from [Releases](https://github.com/hocestnonsatis/sherion/releases), then:
+
+```bash
+sudo dpkg -i sherion_*_amd64.deb
+```
+
+**Linux (.rpm)**
+
+Download `sherion-*.rpm` from [Releases](https://github.com/hocestnonsatis/sherion/releases), then:
+
+```bash
+sudo dnf install ./sherion-*.rpm
+```
+
+**Linux (Flatpak)**
+
+Download `sherion-x86_64.flatpak` from [Releases](https://github.com/hocestnonsatis/sherion/releases), then:
+
+```bash
+flatpak install --user sherion-x86_64.flatpak
+```
+
+**Linux (AppImage)**
+
+Download `Sherion-x86_64.AppImage` from [Releases](https://github.com/hocestnonsatis/sherion/releases), make it executable, and run:
+
+```bash
+chmod +x Sherion-x86_64.AppImage
+./Sherion-x86_64.AppImage
+```
+
 ---
 
 ## Quick start

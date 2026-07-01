@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>com.hocestnonsatis.Sherion</id>
+  <name>Sherion</name>
+  <summary>GPU-accelerated terminal emulator</summary>
+  <description>
+    <p>
+      Sherion is a modern terminal emulator built on winit, wgpu, and vello with
+      tabs, split panes, GPU text rendering, and full VT/ANSI compatibility.
+    </p>
+  </description>
+  <launchable type="desktop-id">com.hocestnonsatis.Sherion.desktop</launchable>
+  <developer_name>hocestnonsatis</developer_name>
+  <url type="homepage">https://github.com/hocestnonsatis/sherion</url>
+  <url type="bugtracker">https://github.com/hocestnonsatis/sherion/issues</url>
+  <url type="vcs-browser">https://github.com/hocestnonsatis/sherion</url>
+  <metadata_license>MIT</metadata_license>
+  <project_license>MIT</project_license>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="0.1.2" date="2026-07-01">
+      <description>
+        <p>Add multi-format packaging: Homebrew, .deb, .rpm, Flatpak, and AppImage.</p>
+      </description>
+    </release>
+  </releases>
+</component>

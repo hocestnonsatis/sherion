@@ -1,0 +1,152 @@
+# Linux package formats (.deb, .rpm, Flatpak, AppImage) uploaded to GitHub Releases.
+# Runs after the cargo-dist Release workflow publishes a release.
+
+name: Release Packages
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+env:
+  TAG: ${{ github.event.release.tag_name }}
+
+jobs:
+  package-deb:
+    name: Debian (.deb)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libfontconfig-dev \
+            libxkbcommon-dev \
+            libwayland-dev \
+            libxcb1-dev
+      - name: Install cargo-deb
+        run: cargo install cargo-deb --locked --version 3.6.4
+      - name: Build .deb
+        run: cargo deb
+      - name: Upload .deb to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${TAG}" target/debian/*.deb --clobber
+
+  package-rpm:
+    name: RPM (.rpm)
+    runs-on: ubuntu-latest
+    container: fedora:41
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+      - name: Install build dependencies
+        run: |
+          dnf install -y \
+            gcc \
+            git \
+            fontconfig-devel \
+            libxkbcommon-devel \
+            wayland-devel \
+            libxcb-devel \
+            perl-FindBin \
+            perl-IPC-Cmd
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Install cargo-generate-rpm
+        run: |
+          source "$HOME/.cargo/env"
+          cargo install cargo-generate-rpm --locked --version 0.21.0
+      - name: Build .rpm
+        run: |
+          source "$HOME/.cargo/env"
+          cargo generate-rpm
+      - name: Install GitHub CLI
+        run: dnf install -y gh
+      - name: Upload .rpm to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${TAG}" target/generate-rpm/*.rpm --clobber
+
+  package-flatpak:
+    name: Flatpak (.flatpak)
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/flathub-infra/flatpak-github-actions:gnome-48
+      options: --privileged
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+      - name: Regenerate cargo-sources.json
+        run: bash scripts/generate-flatpak-cargo-sources.sh
+      - uses: flatpak/flatpak-github-actions/flatpak-builder@v6
+        with:
+          bundle: sherion-x86_64.flatpak
+          manifest-path: flatpak/com.hocestnonsatis.Sherion.yml
+          cache-key: sherion-flatpak-${{ github.sha }}
+      - name: Install GitHub CLI
+        run: |
+          apt-get update
+          apt-get install -y curl
+          curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+            | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+          chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+            > /etc/apt/sources.list.d/github-cli.list
+          apt-get update
+          apt-get install -y gh
+      - name: Upload Flatpak bundle to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${TAG}" sherion-x86_64.flatpak --clobber
+
+  package-appimage:
+    name: AppImage
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v6
+      - name: Download Linux archive from release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p dist
+          gh release download "${TAG}" \
+            --repo "${{ github.repository }}" \
+            --pattern '*x86_64-unknown-linux-gnu.tar.*' \
+            --dir dist \
+            --clobber
+          archive="$(find dist -name '*x86_64-unknown-linux-gnu.tar.*' | head -1)"
+          tar -xf "${archive}" -C dist
+          find dist -name sherion -type f -executable | head -1 | xargs -I{} cp {} dist/sherion
+          chmod +x dist/sherion
+      - name: Build AppImage
+        run: |
+          wget -q https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
+          wget -q https://github.com/linuxdeploy/linuxdeploy-plugin-appimage/releases/download/continuous/linuxdeploy-plugin-appimage-x86_64.AppImage
+          chmod +x linuxdeploy-x86_64.AppImage linuxdeploy-plugin-appimage-x86_64.AppImage
+          export ARCH=x86_64
+          export VERSION="${TAG#v}"
+          ./linuxdeploy-x86_64.AppImage \
+            --appdir AppDir \
+            --executable dist/sherion \
+            --desktop-file packaging/com.hocestnonsatis.Sherion.desktop \
+            --icon-file assets/icons/hicolor/256x256/apps/com.hocestnonsatis.Sherion.png \
+            --plugin appimage \
+            --output appimage
+          mv AppDir/*.AppImage "Sherion-${ARCH}.AppImage"
+      - name: Upload AppImage to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${TAG}" Sherion-x86_64.AppImage --clobber

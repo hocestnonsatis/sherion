@@ -1,12 +1,42 @@
 [package]
 name = "sherion"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "A high-performance Rust terminal emulator"
 authors = ["hocestnonsatis"]
 license = "MIT"
 repository = "https://github.com/hocestnonsatis/sherion"
+homepage = "https://github.com/hocestnonsatis/sherion"
 rust-version = "1.88"
+
+[package.metadata.deb]
+maintainer = "hocestnonsatis"
+copyright = "2026, hocestnonsatis"
+license-file = ["LICENSE", "4"]
+section = "utils"
+priority = "optional"
+depends = "$auto, libfontconfig1, libxkbcommon0, libwayland-client0, libxcb1"
+assets = [
+    ["target/release/sherion", "usr/bin/", "755"],
+    ["packaging/com.hocestnonsatis.Sherion.desktop", "usr/share/applications/", "644"],
+    ["assets/icons/hicolor/16x16/apps/com.hocestnonsatis.Sherion.png", "usr/share/icons/hicolor/16x16/apps/", "644"],
+    ["assets/icons/hicolor/32x32/apps/com.hocestnonsatis.Sherion.png", "usr/share/icons/hicolor/32x32/apps/", "644"],
+    ["assets/icons/hicolor/48x48/apps/com.hocestnonsatis.Sherion.png", "usr/share/icons/hicolor/48x48/apps/", "644"],
+    ["assets/icons/hicolor/64x64/apps/com.hocestnonsatis.Sherion.png", "usr/share/icons/hicolor/64x64/apps/", "644"],
+    ["assets/icons/hicolor/128x128/apps/com.hocestnonsatis.Sherion.png", "usr/share/icons/hicolor/128x128/apps/", "644"],
+    ["assets/icons/hicolor/256x256/apps/com.hocestnonsatis.Sherion.png", "usr/share/icons/hicolor/256x256/apps/", "644"],
+    ["assets/icons/hicolor/512x512/apps/com.hocestnonsatis.Sherion.png", "usr/share/icons/hicolor/512x512/apps/", "644"],
+    ["packaging/com.hocestnonsatis.Sherion.metainfo.xml", "usr/share/metainfo/", "644"],
+]
+
+[package.metadata.generate-rpm]
+assets = [
+    { source = "target/release/sherion", dest = "/usr/bin/sherion", mode = "755" },
+    { source = "packaging/com.hocestnonsatis.Sherion.desktop", dest = "/usr/share/applications/com.hocestnonsatis.Sherion.desktop", mode = "644" },
+    { source = "assets/icons/hicolor/256x256/apps/com.hocestnonsatis.Sherion.png", dest = "/usr/share/icons/hicolor/256x256/apps/com.hocestnonsatis.Sherion.png", mode = "644" },
+    { source = "packaging/com.hocestnonsatis.Sherion.metainfo.xml", dest = "/usr/share/metainfo/com.hocestnonsatis.Sherion.metainfo.xml", mode = "644" },
+]
+requires = { "fontconfig" = "*", "libxkbcommon" = "*", "wayland-client" = "*" }
 
 [package.metadata.wix]
 upgrade-guid = "52179E66-3A8F-4DAC-BB89-FB7E7F0C0559"
@@ -60,7 +90,11 @@ alacritty_terminal = { path = "vendor/alacritty_terminal" }
 # Target platforms to build apps for (Rust target-triple syntax)
 targets = ["aarch64-apple-darwin", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
 # The installers to generate for each app
-installers = ["shell", "powershell", "msi"]
+installers = ["shell", "powershell", "homebrew", "msi"]
+# A GitHub repo to push Homebrew formulas to
+tap = "hocestnonsatis/homebrew-tap"
+# Publish jobs to run in CI
+publish-jobs = ["homebrew"]
 # CI backends to support
 ci = "github"
 # The preferred dist version to use in CI (Cargo.toml SemVer syntax)

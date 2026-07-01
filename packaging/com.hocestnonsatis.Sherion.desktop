@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Sherion
+GenericName=Terminal Emulator
+Comment=GPU-accelerated terminal emulator
+Exec=sherion
+Icon=com.hocestnonsatis.Sherion
+Categories=System;TerminalEmulator;
+Keywords=terminal;emulator;gpu;vt;ansi;
+StartupNotify=true
+Terminal=false

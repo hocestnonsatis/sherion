@@ -1,0 +1,39 @@
+id: com.hocestnonsatis.Sherion
+runtime: org.freedesktop.Platform
+runtime-version: '24.08'
+sdk: org.freedesktop.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: sherion
+rename-desktop-file: com.hocestnonsatis.Sherion.desktop
+rename-icon: com.hocestnonsatis.Sherion
+finish-args:
+  - --share=ipc
+  - --device=dri
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --socket=pulseaudio
+  - --filesystem=home
+  - --talk-name=org.freedesktop.portal.*
+build-options:
+  append-path: /usr/lib/sdk/rust-stable/bin
+  env:
+    CARGO_HOME: /run/build/sherion/cargo
+    CARGO_NET_OFFLINE: 'true'
+modules:
+  - name: sherion
+    buildsystem: simple
+    build-commands:
+      - cargo --offline build --release
+      - install -Dm755 target/release/sherion ${FLATPAK_DEST}/bin/sherion
+      - install -Dm644 packaging/com.hocestnonsatis.Sherion.desktop ${FLATPAK_DEST}/share/applications/com.hocestnonsatis.Sherion.desktop
+      - install -Dm644 packaging/com.hocestnonsatis.Sherion.metainfo.xml ${FLATPAK_DEST}/share/metainfo/com.hocestnonsatis.Sherion.metainfo.xml
+      - |
+        for size in 16 32 48 64 128 256 512; do
+          install -Dm644 assets/icons/hicolor/${size}x${size}/apps/com.hocestnonsatis.Sherion.png \
+            ${FLATPAK_DEST}/share/icons/hicolor/${size}x${size}/apps/com.hocestnonsatis.Sherion.png
+        done
+    sources:
+      - cargo-sources.json
+      - type: dir
+        path: ..
