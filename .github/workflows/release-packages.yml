@@ -15,6 +15,16 @@ on:
         description: Release tag to package (e.g. v0.1.2)
         required: true
         type: string
+      skip_deb:
+        description: Skip rebuilding the .deb package
+        required: false
+        type: boolean
+        default: false
+      skip_appimage:
+        description: Skip rebuilding the AppImage
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -25,7 +35,7 @@ env:
 jobs:
   package-deb:
     name: Debian (.deb)
-    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
+    if: ${{ (github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success') && !(github.event_name == 'workflow_dispatch' && inputs.skip_deb) }}
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v6
@@ -89,12 +99,14 @@ jobs:
         run: |
           curl -fsSL https://github.com/cli/cli/releases/download/v2.67.0/gh_2.67.0_linux_amd64.tar.gz -o /tmp/gh.tgz
           tar -xzf /tmp/gh.tgz -C /tmp
-          install /tmp/gh_2.67.0_linux_amd64/bin/gh /usr/local/bin/gh
+          echo "GH=/tmp/gh_2.67.0_linux_amd64/bin/gh" >> "$GITHUB_ENV"
       - name: Upload .rpm to release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release upload "${TAG}" target/generate-rpm/*.rpm --clobber
+          git config --global --add safe.directory '*'
+          "${GH}" release upload "${TAG}" target/generate-rpm/*.rpm \
+            --repo "${{ github.repository }}" --clobber
 
   package-flatpak:
     name: Flatpak (.flatpak)
@@ -119,16 +131,18 @@ jobs:
         run: |
           curl -fsSL https://github.com/cli/cli/releases/download/v2.67.0/gh_2.67.0_linux_amd64.tar.gz -o /tmp/gh.tgz
           tar -xzf /tmp/gh.tgz -C /tmp
-          install /tmp/gh_2.67.0_linux_amd64/bin/gh /usr/local/bin/gh
+          echo "GH=/tmp/gh_2.67.0_linux_amd64/bin/gh" >> "$GITHUB_ENV"
       - name: Upload Flatpak bundle to release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release upload "${TAG}" sherion-x86_64.flatpak --clobber
+          git config --global --add safe.directory '*'
+          "${GH}" release upload "${TAG}" *.flatpak \
+            --repo "${{ github.repository }}" --clobber
 
   package-appimage:
     name: AppImage
-    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
+    if: ${{ (github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success') && !(github.event_name == 'workflow_dispatch' && inputs.skip_appimage) }}
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v6
