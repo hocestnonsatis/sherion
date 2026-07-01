@@ -6,16 +6,26 @@ name: Release Packages
 on:
   release:
     types: [published]
+  workflow_run:
+    workflows: [Release]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to package (e.g. v0.1.2)
+        required: true
+        type: string
 
 permissions:
   contents: write
 
 env:
-  TAG: ${{ github.event.release.tag_name }}
+  TAG: ${{ github.event.release.tag_name || github.event.inputs.tag || github.event.workflow_run.head_branch }}
 
 jobs:
   package-deb:
     name: Debian (.deb)
+    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v6
@@ -42,6 +52,7 @@ jobs:
 
   package-rpm:
     name: RPM (.rpm)
+    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
     container: fedora:41
     steps:
@@ -79,6 +90,7 @@ jobs:
 
   package-flatpak:
     name: Flatpak (.flatpak)
+    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
     container:
       image: ghcr.io/flathub-infra/flatpak-github-actions:gnome-48
@@ -113,6 +125,7 @@ jobs:
 
   package-appimage:
     name: AppImage
+    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v6
