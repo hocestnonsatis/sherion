@@ -30,6 +30,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
+          ref: ${{ env.TAG }}
           submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
       - name: Install Linux build dependencies
@@ -56,8 +57,11 @@ jobs:
     runs-on: ubuntu-latest
     container: fedora:41
     steps:
+      - name: Install git
+        run: dnf install -y git
       - uses: actions/checkout@v6
         with:
+          ref: ${{ env.TAG }}
           submodules: recursive
       - name: Install build dependencies
         run: |
@@ -98,6 +102,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
+          ref: ${{ env.TAG }}
           submodules: recursive
       - name: Regenerate cargo-sources.json
         run: bash scripts/generate-flatpak-cargo-sources.sh
@@ -129,6 +134,8 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ env.TAG }}
       - name: Download Linux archive from release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -155,9 +162,8 @@ jobs:
             --executable dist/sherion \
             --desktop-file packaging/com.hocestnonsatis.Sherion.desktop \
             --icon-file assets/icons/hicolor/256x256/apps/com.hocestnonsatis.Sherion.png \
-            --plugin appimage \
             --output appimage
-          mv AppDir/*.AppImage "Sherion-${ARCH}.AppImage"
+          mv sherion-*.AppImage "Sherion-${ARCH}.AppImage" 2>/dev/null || mv *.AppImage "Sherion-${ARCH}.AppImage"
       - name: Upload AppImage to release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

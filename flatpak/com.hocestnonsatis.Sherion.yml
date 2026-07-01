@@ -5,8 +5,6 @@ sdk: org.freedesktop.Sdk
 sdk-extensions:
   - org.freedesktop.Sdk.Extension.rust-stable
 command: sherion
-rename-desktop-file: com.hocestnonsatis.Sherion.desktop
-rename-icon: com.hocestnonsatis.Sherion
 finish-args:
   - --share=ipc
   - --device=dri
